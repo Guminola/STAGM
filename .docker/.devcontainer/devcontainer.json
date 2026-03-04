@@ -1,0 +1,32 @@
+{
+    "name": "stagam-env",
+    "image": "stagam:latest",
+    "runArgs": [
+        "--gpus",
+        "all",
+        "--shm-size=8g"
+    ],
+    "containerEnv": {
+        "CONDA_DEFAULT_ENV": "stagam-env"
+    },
+    "postStartCommand": "conda run --no-capture-output -n stagam-env pip install --root-user-action=ignore -r /workspace/requirements.txt",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-toolsai.jupyter"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/opt/conda/envs/stagam-env/bin/python",
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "terminal.integrated.shellArgs.linux": [
+                    "--init-file",
+                    "/opt/conda/etc/profile.d/conda.sh"
+                ]
+            }
+        }
+    },
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "workspaceFolder": "/workspace"
+}

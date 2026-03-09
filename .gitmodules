@@ -4,3 +4,6 @@
 [submodule "docs"]
 	path = docs
 	url = git@github.com:Guminola/GMST-Documentation.git
+[submodule "STAIG"]
+	path = STAIG
+	url = git@github.com:Guminola/STAIG.git

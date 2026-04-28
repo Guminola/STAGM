@@ -1,0 +1,38 @@
+# ============================================================
+# stagm-env requirements.txt
+#
+# The full torch/PyG/mamba-ssm stack stays cached. Rebuild with:
+#   docker build -t stagm:latest .   (no --no-cache)
+# ============================================================
+
+# ── Jupiter dependencies ────────────────────────────────────
+ipykernel
+jupyter
+ipywidgets
+
+# ── Scientific stack ────────────────────────────────────────
+numpy
+scipy
+pandas
+scikit-learn
+matplotlib
+
+# seaborn
+
+# ── Project packages ────────────────────────────────────────
+anndata
+scanpy
+squidpy
+scikit-misc
+igraph
+tqdm
+leidenalg
+
+# anndata2ri
+# networkx
+# PyWGCNA
+# SpatialDE
+# harmonypy
+# NaiveDE
+# pot
+# loguru

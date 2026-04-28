@@ -1,0 +1,13 @@
+# Ignore files
+*.yaml
+*.pt
+*.log
+
+# Ignore folders
+.devcontainer/
+.vscode/
+figures/
+Dataset/
+src/__pycache__/
+
+

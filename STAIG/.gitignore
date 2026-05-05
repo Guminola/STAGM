@@ -1,0 +1,13 @@
+# Ignore files
+*.txt
+*.pt
+=1.4.0
+
+# Ignore folders
+.devcontainer/
+.vscode/
+src/Dataset/
+src/example/raw/
+src/example/subset/
+src/figures/
+mamba/

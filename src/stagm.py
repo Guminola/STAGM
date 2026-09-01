@@ -27,11 +27,10 @@ from .clustering import clustering
 # STAGM-specific modules
 from .model import Encoder, MVmodel, SVmodel, drop_feature, multiple_dropout_average
 
-# Only GCNConv is used as the local-MPNN branch inside GPSConv; the global
-# branch is always the Mamba SSM (see model.Encoder / model.GPSConv).
+# Only GCNConv is used as the local-MPNN branch inside GPSConv
 _ACTIVATIONS = {"relu": nn.functional.relu, "prelu": nn.PReLU()}
 
-# clustering.py only implements resolution search for these two tools.
+# clustering.py only implements resolution search for these tools.
 _SUPPORTED_CLUSTER_TOOLS = ("leiden", "louvain")
 
 
@@ -123,10 +122,7 @@ class STAGM:
             weight_decay=self.weight_decay,
         )
 
-    # ------------------------------------------------------------------ #
     # Shared tensor prep (used by both train() and eva())
-    # ------------------------------------------------------------------ #
-
     def _prepare_graph_tensors(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -158,10 +154,7 @@ class STAGM:
             pseudo_labels = generate_pseudo_labels(self.adata.obsm["img_emb"])
         return pseudo_labels.to(self.device)
 
-    # ------------------------------------------------------------------ #
     # Training / evaluation
-    # ------------------------------------------------------------------ #
-
     def train(self) -> None:
         features_matrix, graph_neigh, edge_index, batch = self._prepare_graph_tensors()
 
@@ -289,10 +282,7 @@ class STAGM:
         )
         print("=======================================\n")
 
-    # ------------------------------------------------------------------ #
     # Clustering / metrics
-    # ------------------------------------------------------------------ #
-
     def cluster(self, label: bool = True) -> None:
         if self.tool not in _SUPPORTED_CLUSTER_TOOLS:
             raise ValueError(
@@ -333,10 +323,7 @@ class STAGM:
             print("SC:", SC)
             print("DB:", DB)
 
-    # ------------------------------------------------------------------ #
     # Visualization
-    # ------------------------------------------------------------------ #
-
     def draw_spatial(self, p: str = "") -> None:
         sq.pl.spatial_scatter(
             self.adata,

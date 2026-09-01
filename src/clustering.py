@@ -1,3 +1,6 @@
+# Standard Library
+from collections import Counter
+
 # Scientific Stack & General Data Processing
 import numpy as np
 
@@ -7,11 +10,29 @@ import scanpy as sc
 # PyTorch & Deep Learning
 from anndata import AnnData
 
-# SciPy: Sparse matrices, spatial distances, and special functions
-from scipy.spatial.distance import cdist
-
 # Scikit-learn: Metrics, Decomposition, and Preprocessing
 from sklearn import metrics
+from sklearn.neighbors import NearestNeighbors
+
+_SUPPORTED_METHODS = ("leiden", "louvain")
+
+_CLUSTER_KWARGS = {
+    "leiden": dict(flavor="igraph", n_iterations=2, directed=False),
+    "louvain": dict(flavor="igraph"),
+}
+_CLUSTER_FN = {"leiden": sc.tl.leiden, "louvain": sc.tl.louvain}
+
+
+def _run_cluster(adata: AnnData, method: str, resolution: float) -> np.ndarray:
+    """Run one leiden/louvain pass (igraph backend) and return the labels."""
+    if method not in _SUPPORTED_METHODS:
+        raise ValueError(
+            f"Unsupported clustering method '{method}'. Choose one of {_SUPPORTED_METHODS}."
+        )
+    _CLUSTER_FN[method](
+        adata, random_state=0, resolution=resolution, **_CLUSTER_KWARGS[method]
+    )
+    return adata.obs[method].to_numpy()
 
 
 def clustering(
@@ -19,21 +40,21 @@ def clustering(
     n_clusters: int = 7,
     radius: int = 50,
     key: str = "emb",
-    method: str = "mclust",
+    method: str = "leiden",
     start: float = 0.1,
     end: float = 3.0,
     increment: float = 0.01,
     refinement: bool = False,
 ) -> None:
     """
-    Spatial clustering based the learned representation.
+    Spatial clustering based on the learned representation.
 
     Args:
         adata:      An AnnData object containing the learned representation in adata.obsm[key].
         n_clusters: Number of clusters.
         radius:     Number of neighbors considered during refinement.
         key:        The key of the learned representation in adata.obsm.
-        method:     Clustering tool. Supported tools include 'leiden', and 'louvain'.
+        method:     Clustering tool. Supported tools include 'leiden' and 'louvain'.
         start:      The start value for searching.
         end:        The end value for searching.
         increment:  Step size to increase.
@@ -42,50 +63,41 @@ def clustering(
     Returns:
          None. The predicted labels will be stored in adata.obs['domain'].
     """
-    res: float = search_res(
-        radius,
+    _, labels = search_res(
         adata,
         n_clusters,
-        use_rep=key,
         method=method,
+        use_rep=key,
         start=start,
         end=end,
         increment=increment,
     )
-
-    if method == "leiden":
-        sc.tl.leiden(adata, random_state=0, resolution=res)
-
-    if method == "louvain":
-        sc.tl.louvain(adata, random_state=0, resolution=res)
-
-    adata.obs["domain"] = adata.obs[method]
+    adata.obs["domain"] = labels
 
     if refinement:
-        new_type = refine_label(adata, radius, key="domain")
-        adata.obs["domain"] = new_type
+        adata.obs["domain"] = refine_label(adata, radius, key="domain")
 
 
-def refine_label(adata: AnnData, radius: int = 50, key: str = "label") -> list[str]:
-    n_neigh = radius
-    old_type = adata.obs[key].astype(str).values
+def refine_label(adata: AnnData, radius: int = 50, key: str = "label") -> np.ndarray:
+    """
+    Majority-vote label smoothing: each spot's label is replaced by the most
+    common label among its `radius` nearest spatial neighbors.
 
-    # Calculate pairwise euclidean distances between spatial positions
+    Uses a KD-tree (via sklearn's NearestNeighbors) rather than a full
+    pairwise distance matrix, so this scales to large slides.
+    """
+    old_type = adata.obs[key].astype(str).to_numpy()
     position = adata.obsm["spatial"]
-    distance = cdist(position, position, metric="euclidean")
 
-    n_cell = distance.shape[0]
-    new_type: list[str] = []
-    for i in range(n_cell):
-        index = distance[i, :].argsort()
-        neigh_type = [old_type[index[j]] for j in range(1, n_neigh + 1)]
-        new_type.append(max(neigh_type, key=neigh_type.count))
+    # +1 to include the point itself in the query, then drop it below.
+    nbrs = NearestNeighbors(n_neighbors=radius + 1).fit(position)
+    _, neighbor_idx = nbrs.kneighbors(position)
 
-    return new_type
+    new_type = [Counter(old_type[idx[1:]]).most_common(1)[0][0] for idx in neighbor_idx]
+    return np.array(new_type)
 
 
 def search_res(
-    radius: int,
     adata: AnnData,
     n_clusters: int,
     method: str = "leiden",
@@ -93,13 +105,19 @@ def search_res(
     start: float = 0.1,
     end: float = 3.0,
     increment: float = 0.01,
-) -> float:
+) -> tuple[float, np.ndarray]:
     """
-    Searching corresponding resolution according to given cluster number
+    Search the clustering resolution that yields `n_clusters` clusters.
+
+    When `adata.obs['ground_truth']` is present, candidate resolutions that
+    produce exactly `n_clusters` clusters are ranked by ARI against it and
+    the best-scoring one is kept. Otherwise (no ground truth available,
+    e.g. unlabeled data) the first matching resolution encountered — the
+    largest one, since the search runs from `end` down to `start` — is used.
 
     Args:
         adata:      An AnnData object containing the learned representation in adata.obsm[use_rep].
-        n_clusters: Targetting number of clusters.
+        n_clusters: Targeting number of clusters.
         method:     Tool for clustering. Supported tools include 'leiden' and 'louvain'.
         use_rep:    The indicated representation for clustering.
         start:      The start value for searching.
@@ -107,67 +125,64 @@ def search_res(
         increment:  Step size to increase.
 
     Returns:
-        Best[0]:    The resolution corresponding to the best ARI score.
+        (best_resolution, cluster_labels_at_best_resolution)
     """
+    if method not in _SUPPORTED_METHODS:
+        raise ValueError(
+            f"Unsupported clustering method '{method}'. Choose one of {_SUPPORTED_METHODS}."
+        )
 
-    def _cluster(resolution):
-        """Run the chosen clustering method and return the unique cluster count."""
-        if method == "leiden":
-            sc.tl.leiden(
-                adata,
-                random_state=0,
-                resolution=resolution,
-                flavor="igraph",
-                n_iterations=2,
-            )
-            return len(adata.obs["leiden"].unique())
-        else:
-            sc.tl.louvain(
-                adata,
-                random_state=0,
-                resolution=resolution,
-                flavor="igraph",
-                n_iterations=2,
-            )
-            return len(adata.obs["louvain"].unique())
+    has_ground_truth = "ground_truth" in adata.obs
 
     print("Searching resolution...")
     sc.pp.neighbors(adata, n_neighbors=20, use_rep=use_rep)
 
+    def _cluster(resolution: float) -> np.ndarray:
+        return _run_cluster(adata, method, resolution)
+
     # Coarsely adjust `end` so the upper-bound cluster count is n_clusters + 2
-    count_unique = _cluster(end)
+    labels = _cluster(end)
+    count_unique = len(np.unique(labels))
     while count_unique > n_clusters + 2:
         print(f"Cluster count {count_unique} is too large, adjusting end downward...")
         end -= 0.1
-        count_unique = _cluster(end)
+        labels = _cluster(end)
+        count_unique = len(np.unique(labels))
     while count_unique < n_clusters + 2:
         print(f"Cluster count {count_unique} is too small, adjusting end upward...")
         end += 0.1
-        count_unique = _cluster(end)
+        labels = _cluster(end)
+        count_unique = len(np.unique(labels))
 
     # Fine-grained search over [start, end)
-    ress = []
-    found = False
+    best_res: float | None = None
+    best_labels: np.ndarray | None = None
+    best_ari = -np.inf
     for res in sorted(np.arange(start, end, increment), reverse=True):
-        count_unique = _cluster(res)
+        labels = _cluster(res)
+        count_unique = len(np.unique(labels))
         print(f"resolution={res:.4f}, cluster number={count_unique}")
 
         if count_unique == n_clusters:
-            new_type = refine_label(adata, radius, key="leiden")
-            adata.obs["leiden"] = new_type
-            ARI = metrics.adjusted_rand_score(
-                adata.obs["leiden"], adata.obs["ground_truth"]
-            )
-            adata.uns["ARI"] = ARI
-            ress.append((res, ARI))
-            print(f"ARI: {ARI:.4f}")
+            if has_ground_truth:
+                ari = metrics.adjusted_rand_score(labels, adata.obs["ground_truth"])
+                print(f"ARI: {ari:.4f}")
+                if ari > best_ari:
+                    best_res, best_labels, best_ari = res, labels, ari
+            elif best_res is None:
+                best_res, best_labels = res, labels
 
         if count_unique == n_clusters - 2:
-            found = True
-            best = max(ress, key=lambda x: x[1])
-            print(f"Best resolution found: {best}")
             break
 
-    assert found, "Resolution not found. Please try a bigger range or a smaller step."
+    assert best_res is not None, (
+        "Resolution not found. Please try a bigger range or a smaller step."
+    )
 
-    return best[0]
+    if has_ground_truth:
+        adata.uns["ARI"] = best_ari
+        print(f"Best resolution found: (res={best_res:.4f}, ARI={best_ari:.4f})")
+    else:
+        print(f"Best resolution found: {best_res:.4f}")
+
+    return best_res, best_labels

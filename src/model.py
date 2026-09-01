@@ -1,11 +1,11 @@
 # Standard Library
 import inspect
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 # PyTorch & Deep Learning
 import torch
-import torch.nn as nn
 from mamba_ssm import Mamba
+from torch import nn
 
 # PyTorch Geometric (Graph Neural Networks)
 from torch_geometric.nn import GCNConv, MessagePassing
@@ -29,14 +29,7 @@ def _permute_within_batch(node_features: Tensor, batch: Tensor) -> Tensor:
 
 
 def _reverse_within_batch(batch: Tensor) -> Tensor:
-    """
-    Returns an index tensor that reverses node order within each graph.
-
-    Unlike a random permutation, this index is self-inverse: gathering with
-    it twice returns the original order. That lets the backward Mamba pass
-    reuse the same index both to build the reversed sequence and to restore
-    the original node order afterwards.
-    """
+    """Returns an index tensor that reverses node order within each graph."""
     reversed_indices = [
         (batch == b).nonzero(as_tuple=True)[0].flip(0) for b in torch.unique(batch)
     ]
@@ -74,12 +67,12 @@ class GPSConv(torch.nn.Module):
     def __init__(
         self,
         channels: int,
-        conv: Optional[MessagePassing],
+        conv: MessagePassing | None,
         dropout: float = 0.0,
         act: str = "relu",
-        act_kwargs: Optional[Dict[str, Any]] = None,
-        norm: Optional[str] = "batch_norm",
-        norm_kwargs: Optional[Dict[str, Any]] = None,
+        act_kwargs: dict[str, Any] | None = None,
+        norm: str | None = "batch_norm",
+        norm_kwargs: dict[str, Any] | None = None,
         order_by_degree: bool = False,
         shuffle_ind: int = 0,
         d_state: int = 16,
@@ -102,8 +95,6 @@ class GPSConv(torch.nn.Module):
 
         self.mamba = Mamba(d_model=channels, d_state=d_state, d_conv=d_conv, expand=1)
         if self.bidirectional:
-            # Separate weights for the backward scan (standard BiMamba practice);
-            # fuse forward + backward hidden states back down to `channels`.
             self.mamba_rev = Mamba(
                 d_model=channels, d_state=d_state, d_conv=d_conv, expand=1
             )
@@ -156,7 +147,9 @@ class GPSConv(torch.nn.Module):
 
         return h
 
-    def _apply_norm(self, norm, node_features: Tensor, batch: Tensor) -> Tensor:
+    def _apply_norm(
+        self, norm: nn.Module | None, node_features: Tensor, batch: Tensor
+    ) -> Tensor:
         if norm is None:
             return node_features
         return (
@@ -200,7 +193,7 @@ class GPSConv(torch.nn.Module):
             h = sum(shuffled) / self.shuffle_ind
 
         h = nn.functional.dropout(h, p=self.dropout, training=self.training)
-        h = h + node_features  # residual
+        h = h + node_features
         h = self._apply_norm(self.norm2, h, batch)
         branch_outputs.append(h)
 
@@ -278,8 +271,6 @@ class Encoder(torch.nn.Module):
                 bidirectional=bidirectional,
             )
 
-        # All GPSConv layers keep the same width (hidden_channels); narrowing
-        # to out_channels, when needed, happens once via `output_proj` below.
         self.gps_layers = nn.ModuleList(
             _make_gps(hidden_channels) for _ in range(num_layers)
         )
@@ -396,7 +387,7 @@ class MVmodel(_ProjectionMixin):
         emb_a: Tensor,
         emb_b: Tensor,
         adj: Tensor,
-        pseudo_labels: Optional[Tensor] = None,
+        pseudo_labels: Tensor | None = None,
     ) -> Tensor:
         """
         Neighbour-aware NT-Xent term. When `pseudo_labels` is given, pairs
@@ -468,7 +459,7 @@ class SVmodel(_ProjectionMixin):
         emb_a: Tensor,
         emb_b: Tensor,
         adj: Tensor,
-        sample_mask: Optional[Tensor] = None,
+        sample_mask: Tensor | None = None,
     ) -> Tensor:
         adj = self._strip_self_loops(adj)
         positive_pair_counts = self._positive_pair_counts(adj)
@@ -492,7 +483,7 @@ class SVmodel(_ProjectionMixin):
         emb_a: Tensor,
         emb_b: Tensor,
         adj: Tensor,
-        sample_mask: Optional[Tensor] = None,
+        sample_mask: Tensor | None = None,
         mean: bool = True,
     ) -> Tensor:
         per_node = (
@@ -515,7 +506,7 @@ def drop_feature(node_features: Tensor, drop_prob: float) -> Tensor:
 
 def filter_adj(
     row: Tensor, col: Tensor, edge_attr: OptTensor, keep_mask: Tensor
-) -> Tuple[Tensor, Tensor, OptTensor]:
+) -> tuple[Tensor, Tensor, OptTensor]:
     filtered_attr = None if edge_attr is None else edge_attr[keep_mask]
     return row[keep_mask], col[keep_mask], filtered_attr
 
@@ -525,7 +516,7 @@ def dropout_adj(
     edge_attr: Tensor,
     force_undirected: bool = False,
     training: bool = True,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """
     Probability-weighted edge dropout: edge (u, v) is kept with probability
     `1 - edge_attr[u, v]`. All work happens on `edge_index`/`edge_attr`'s own
@@ -561,7 +552,7 @@ def multiple_dropout_average(
     edge_attr: Tensor,
     force_undirected: bool = False,
     training: bool = True,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """Thin wrapper around `dropout_adj` used to build each contrastive view."""
     if not training:
         return edge_index, edge_attr

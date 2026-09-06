@@ -79,13 +79,7 @@ def clustering(
 
 
 def refine_label(adata: AnnData, radius: int = 50, key: str = "label") -> np.ndarray:
-    """
-    Majority-vote label smoothing: each spot's label is replaced by the most
-    common label among its `radius` nearest spatial neighbors.
-
-    Uses a KD-tree (via sklearn's NearestNeighbors) rather than a full
-    pairwise distance matrix, so this scales to large slides.
-    """
+    """Refine the predicted labels by majority voting among neighbors."""
     old_type = adata.obs[key].astype(str).to_numpy()
     position = adata.obsm["spatial"]
 

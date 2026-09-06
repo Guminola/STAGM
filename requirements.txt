@@ -23,6 +23,7 @@ matplotlib
 anndata
 scanpy
 squidpy
+spatialdata-io
 scikit-misc
 igraph
 tqdm

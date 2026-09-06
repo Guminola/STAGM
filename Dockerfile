@@ -27,7 +27,7 @@ RUN wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Mi
     && rm /tmp/miniforge.sh
 ENV PATH=${CONDA_DIR}/bin:${PATH}
 
-RUN conda create -n stagm-env python=3.11 -y && conda clean -afy
+RUN conda create -n stagm-env python=3.13 -y && conda clean -afy
 
 SHELL ["conda", "run", "-n", "stagm-env", "/bin/bash", "-c"]
 

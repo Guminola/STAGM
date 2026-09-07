@@ -8,6 +8,7 @@
 .vscode/
 figures/
 Dataset/
+STAIG/
 src/__pycache__/
 
 

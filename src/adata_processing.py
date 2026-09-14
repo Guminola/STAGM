@@ -22,20 +22,14 @@ from tqdm import tqdm
 
 
 def generate_pseudo_labels(img_emb: np.ndarray, n_clusters: int) -> np.ndarray:
-    """KMeans pseudo-labels over an embedding (e.g. `obsm['img_emb']`)."""
     return KMeans(n_clusters=n_clusters, random_state=0).fit(img_emb).labels_
 
 
 class _BaseAdataLoader:
-    """Shared graph / feature / edge-weight logic for the loaders below."""
-
-    n_neighbors: int = 3
-
     @staticmethod
     def _read_visium(
         path: str, counts_file: str = "filtered_feature_bc_matrix.h5"
     ) -> AnnData:
-        """Read a 10x Visium sample and immediately dedupe var_names."""
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", message="Variable names are not unique", category=UserWarning
@@ -46,47 +40,47 @@ class _BaseAdataLoader:
 
     @staticmethod
     def _read_xenium(path: str, **kwargs) -> AnnData:
-        from spatialdata_io import xenium as _read_xenium_bundle
+        from spatialdata_io import xenium as read_xenium_bundle
 
-        sdata = _read_xenium_bundle(path, **kwargs)
+        sdata = read_xenium_bundle(path, **kwargs)
         adata = sdata.tables["table"]
         adata.var_names_make_unique()
         return adata
 
     def _spatial_graph(self, adata: AnnData) -> csr_matrix:
-        """Symmetric 0/1 sparse KNN adjacency over `adata.obsm['spatial']`."""
         coords = adata.obsm["spatial"]
         n_neighbors = min(self.n_neighbors, coords.shape[0] - 1)
 
-        adj = kneighbors_graph(
+        adjacency = kneighbors_graph(
             coords, n_neighbors=n_neighbors, mode="connectivity", include_self=False
         )
-        adj = adj.maximum(adj.T)
-        adj.data[:] = 1.0
-        return adj.tocsr()
+        adjacency = adjacency.maximum(adjacency.T)
+        adjacency.data[:] = 1.0
+        return adjacency.tocsr()
 
     @staticmethod
     def _dense(adata: AnnData) -> np.ndarray:
-        X = adata.X
-        return X.toarray() if issparse(X) else np.asarray(X)
+        matrix = adata.X
+        return matrix.toarray() if issparse(matrix) else np.asarray(matrix)
 
     @classmethod
     def _extract_feat(cls, adata: AnnData) -> np.ndarray:
-        """Dense feature matrix for the genes flagged `highly_variable`."""
-        adata_vars = adata[:, adata.var["highly_variable"]]
-        return cls._dense(adata_vars)
+        hvg_adata = adata[:, adata.var["highly_variable"]]
+        return cls._dense(hvg_adata)
 
     @staticmethod
     def _load_image_embedding(path: str, n_components: int = 128) -> np.ndarray:
-        data = np.load(os.path.join(path, "embeddings.npy"))
-        data = data.reshape(data.shape[0], -1)
-        data = StandardScaler().fit_transform(data)
-        return PCA(n_components=n_components, random_state=42).fit_transform(data)
+        embedding = np.load(os.path.join(path, "embeddings.npy"))
+        embedding = embedding.reshape(embedding.shape[0], -1)
+        embedding = StandardScaler().fit_transform(embedding)
+        return PCA(n_components=n_components, random_state=42).fit_transform(embedding)
 
     @staticmethod
     def _load_ground_truth(adata: AnnData, path: str, filter_na: bool) -> AnnData:
-        df_meta = pd.read_csv(os.path.join(path, "truth.txt"), sep="\t", header=None)
-        adata.obs["ground_truth"] = df_meta[1].values
+        ground_truth = pd.read_csv(
+            os.path.join(path, "truth.txt"), sep="\t", header=None
+        )
+        adata.obs["ground_truth"] = ground_truth[1].values
         if filter_na:
             adata = adata[~pd.isnull(adata.obs["ground_truth"])].copy()
         return adata
@@ -95,7 +89,6 @@ class _BaseAdataLoader:
     def _edge_probabilities(
         adj: csr_matrix, node_emb: np.ndarray, metric: str
     ) -> csr_matrix:
-        """Per-node softmax over edge distances, computed only for existing edges."""
         if metric not in ("euclidean", "cosine"):
             raise ValueError(f"Unsupported metric '{metric}'")
 
@@ -105,16 +98,16 @@ class _BaseAdataLoader:
         cols = adj.indices
         rows = np.repeat(np.arange(adj.shape[0]), np.diff(indptr))
 
-        dist = paired_distances(node_emb[rows], node_emb[cols], metric=metric)
+        distances = paired_distances(node_emb[rows], node_emb[cols], metric=metric)
         if metric == "euclidean":
-            dist = np.log(dist)
+            distances = np.log(distances)
 
-        edge_probabilities = np.zeros_like(dist)
-        for i in tqdm(range(adj.shape[0]), desc="Edge probabilities"):
-            start, end = indptr[i], indptr[i + 1]
+        edge_probabilities = np.zeros_like(distances)
+        for node in tqdm(range(adj.shape[0]), desc="Edge probabilities"):
+            start, end = indptr[node], indptr[node + 1]
             if start == end:
                 continue
-            edge_probabilities[start:end] = softmax(dist[start:end])
+            edge_probabilities[start:end] = softmax(distances[start:end])
 
         return csr_matrix((edge_probabilities, cols, indptr), shape=adj.shape)
 
@@ -130,34 +123,6 @@ class _BaseAdataLoader:
 
 
 class SingleAdataLoader(_BaseAdataLoader):
-    """
-    Loads one spatial slice and prepares it for STAGM.
-
-    Args:
-        path: For `source="visium"`, the 10x Visium sample directory
-            (must contain `filtered_feature_bc_matrix.h5`, `truth.txt` if
-            `label=True`, and `embeddings.npy` if `image_emb=True`). For
-            `source="h5ad"`, the path to a `.h5ad` file (labels/images are
-            looked up next to it, in its parent directory). For
-            `source="xenium"`, the Xenium output bundle directory read via
-            `spatialdata_io.xenium` (labels/images are looked up in the same
-            directory, same as `visium`).
-        source: "visium" (`squidpy.read.visium`), "h5ad" (`sc.read_h5ad`),
-            or "xenium" (`spatialdata_io.xenium`).
-        n_top_genes: Highly-variable-gene count. Clamped to the number of
-            genes actually present (relevant for targeted Xenium panels).
-        n_neighbors: KNN degree for the spatial graph.
-        image_emb: Whether to load and use `embeddings.npy` for edge
-            weighting (falls back to gene-expression edge weighting if
-            False).
-        label: Whether to attach `obs['ground_truth']` from `truth.txt`.
-        filter_na: Drop spots with a missing ground-truth label.
-        normalize: Run `normalize_total` + `log1p` + `scale` after HVG
-            selection. Set False if the input is already normalized.
-        xenium_kwargs: Extra kwargs forwarded to `spatialdata_io.xenium`
-            when `source="xenium"`.
-    """
-
     def __init__(
         self,
         path: str,
@@ -227,32 +192,6 @@ class SingleAdataLoader(_BaseAdataLoader):
 
 
 class BatchAdataLoader(_BaseAdataLoader):
-    """Loads and merges multiple spatial slices for STAGM's batch mode.
-
-    Args:
-        slices: Pre-loaded per-slice AnnData objects.
-        dataset_path: Root directory containing one subdirectory per slice.
-        file_list: Subdirectory names under `dataset_path`, one per slice.
-        source: "visium" (`squidpy.read.visium`) or "xenium"
-            (`spatialdata_io.xenium`). Only applies to the
-            `dataset_path`/`file_list` loading path.
-        n_top_genes: Highly-variable-gene count per slice, clamped to the
-            number of genes actually present in that slice (relevant for
-            targeted Xenium panels).
-        n_neighbors: KNN degree for each slice's local spatial graph.
-        image_emb: Load `embeddings.npy` per slice and use it for edge
-            weighting. Only valid together with `dataset_path`/`file_list`,
-            since pre-loaded `slices` have no associated directory to read
-            embeddings from.
-        label: Attach `obs['ground_truth']` per slice from `truth.txt`.
-            Only valid together with `dataset_path`/`file_list`.
-        filter_na: Drop spots with a missing ground-truth label.
-        normalize: Run `normalize_total` + `log1p` per slice before HVG
-            intersection.
-        xenium_kwargs: Extra kwargs forwarded to `spatialdata_io.xenium`
-            when `source="xenium"`.
-    """
-
     def __init__(
         self,
         slices: Sequence[AnnData] | None = None,

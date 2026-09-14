@@ -1,26 +1,18 @@
-# Standard Library
 import inspect
 from typing import Any
 
-# PyTorch & Deep Learning
 import torch
-from mamba_ssm import Mamba
+from mamba_ssm import Mamba as Mamba
 from torch import nn
 
-# PyTorch Geometric (Graph Neural Networks)
 from torch_geometric.nn import GCNConv, MessagePassing
 from torch_geometric.nn.inits import reset
 from torch_geometric.nn.resolver import activation_resolver, normalization_resolver
 from torch_geometric.typing import Adj, OptTensor, Tensor
-from torch_geometric.utils import (
-    degree,
-    sort_edge_index,
-    to_dense_batch,
-)
+from torch_geometric.utils import degree, sort_edge_index, to_dense_batch
 
 
 def _permute_within_batch(node_features: Tensor, batch: Tensor) -> Tensor:
-    """Returns a permuted index tensor that shuffles nodes within each graph."""
     permuted_indices = [
         (batch == b).nonzero().squeeze()[torch.randperm((batch == b).sum().item())]
         for b in torch.unique(batch)
@@ -29,7 +21,6 @@ def _permute_within_batch(node_features: Tensor, batch: Tensor) -> Tensor:
 
 
 def _reverse_within_batch(batch: Tensor) -> Tensor:
-    """Returns an index tensor that reverses node order within each graph."""
     reversed_indices = [
         (batch == b).nonzero(as_tuple=True)[0].flip(0) for b in torch.unique(batch)
     ]
@@ -37,33 +28,6 @@ def _reverse_within_batch(batch: Tensor) -> Tensor:
 
 
 class GPSConv(torch.nn.Module):
-    """
-    GPS-style layer combining a local MPNN with a global Mamba SSM.
-
-    NOTE: `conv` must be a square map (its input and output width must both
-    equal `channels`). GPSConv's residual connections (`h + node_features`)
-    and its feed-forward block all operate at a fixed width of `channels`,
-    so any dimensionality change must happen outside this layer.
-
-    Args:
-        channels:         Node feature dimensionality (in == out).
-        conv:             Local message-passing layer (e.g. GCNConv), mapping
-                           channels -> channels.
-        dropout:          Dropout applied after each sub-layer.
-        act:              Activation name for the feed-forward MLP.
-        act_kwargs:       Extra kwargs forwarded to the activation resolver.
-        norm:             Normalisation layer name (or None).
-        norm_kwargs:      Extra kwargs forwarded to the normalisation resolver.
-        order_by_degree:  Sort nodes by degree before feeding into Mamba.
-        shuffle_ind:      Number of random permutations to average (0 = no shuffle).
-        d_state:          Mamba SSM state size.
-        d_conv:           Mamba conv kernel size.
-        bidirectional:    Run a second Mamba over the reversed sequence and fuse
-                           it with the forward pass, so every node gets context
-                           from both directions of the global scan instead of
-                           only from nodes that preceded it.
-    """
-
     def __init__(
         self,
         channels: int,
@@ -115,8 +79,8 @@ class GPSConv(torch.nn.Module):
 
         self.norm_with_batch = False
         if self.norm1 is not None:
-            sig = inspect.signature(self.norm1.forward)
-            self.norm_with_batch = "batch" in sig.parameters
+            signature = inspect.signature(self.norm1.forward)
+            self.norm_with_batch = "batch" in signature.parameters
 
     def reset_parameters(self):
         if self.conv is not None:
@@ -128,24 +92,17 @@ class GPSConv(torch.nn.Module):
             if norm is not None:
                 norm.reset_parameters()
 
-    def _run_mamba(self, x: Tensor, batch: Tensor) -> Tensor:
-        """
-        Runs the forward Mamba scan (and, if `bidirectional`, a second scan
-        over the reversed sequence) and returns node-level output aligned
-        with `x`'s own node order.
-        """
-        dense, mask = to_dense_batch(x, batch)
-        h = self.mamba(dense)[mask]
+    def _run_mamba(self, node_features: Tensor, batch: Tensor) -> Tensor:
+        dense, mask = to_dense_batch(node_features, batch)
+        forward_out = self.mamba(dense)[mask]
 
-        if self.bidirectional:
-            rev_idx = _reverse_within_batch(batch)
-            dense_rev, mask_rev = to_dense_batch(x[rev_idx], batch[rev_idx])
-            # rev_idx is self-inverse: gathering with it again undoes the
-            # reversal and restores x's original node order.
-            h_rev = self.mamba_rev(dense_rev)[mask_rev][rev_idx]
-            h = self.bidirectional_proj(torch.cat([h, h_rev], dim=-1))
+        if not self.bidirectional:
+            return forward_out
 
-        return h
+        rev_idx = _reverse_within_batch(batch)
+        dense_rev, mask_rev = to_dense_batch(node_features[rev_idx], batch[rev_idx])
+        backward_out = self.mamba_rev(dense_rev)[mask_rev][rev_idx]
+        return self.bidirectional_proj(torch.cat([forward_out, backward_out], dim=-1))
 
     def _apply_norm(
         self, norm: nn.Module | None, node_features: Tensor, batch: Tensor
@@ -167,69 +124,43 @@ class GPSConv(torch.nn.Module):
     ) -> Tensor:
         branch_outputs = []
 
-        # --- Local MPNN branch ---
         if self.conv is not None:
-            h = self.conv(node_features, edge_index, **kwargs)
-            h = nn.functional.dropout(h, p=self.dropout, training=self.training)
-            h = h + node_features  # residual (requires conv output width == channels)
-            h = self._apply_norm(self.norm1, h, batch)
-            branch_outputs.append(h)
+            local_out = self.conv(node_features, edge_index, **kwargs)
+            local_out = nn.functional.dropout(
+                local_out, p=self.dropout, training=self.training
+            )
+            local_out = local_out + node_features
+            local_out = self._apply_norm(self.norm1, local_out, batch)
+            branch_outputs.append(local_out)
 
-        # --- Global Mamba branch ---
-        x = node_features
+        mamba_input = node_features
         if self.order_by_degree:
-            deg = degree(edge_index[0], x.size(0)).to(torch.long)
-            order_tensor = torch.stack([batch, deg], dim=1).T
-            _, x = sort_edge_index(order_tensor, edge_attr=x)
+            node_degree = degree(edge_index[0], mamba_input.size(0)).to(torch.long)
+            order_tensor = torch.stack([batch, node_degree], dim=1).T
+            _, mamba_input = sort_edge_index(order_tensor, edge_attr=mamba_input)
 
         if self.shuffle_ind == 0:
-            h = self._run_mamba(x, batch)
+            global_out = self._run_mamba(mamba_input, batch)
         else:
-            shuffled = []
+            shuffled_outputs = []
             for _ in range(self.shuffle_ind):
-                perm = _permute_within_batch(x, batch)
-                h_i = self._run_mamba(x[perm], batch)[perm]
-                shuffled.append(h_i)
-            h = sum(shuffled) / self.shuffle_ind
+                perm = _permute_within_batch(mamba_input, batch)
+                shuffled_outputs.append(self._run_mamba(mamba_input[perm], batch)[perm])
+            global_out = sum(shuffled_outputs) / self.shuffle_ind
 
-        h = nn.functional.dropout(h, p=self.dropout, training=self.training)
-        h = h + node_features
-        h = self._apply_norm(self.norm2, h, batch)
-        branch_outputs.append(h)
+        global_out = nn.functional.dropout(
+            global_out, p=self.dropout, training=self.training
+        )
+        global_out = global_out + node_features
+        global_out = self._apply_norm(self.norm2, global_out, batch)
+        branch_outputs.append(global_out)
 
-        # --- Combine branches + feed-forward ---
-        out = sum(branch_outputs)
-        out = out + self.mlp(out)
-        out = self._apply_norm(self.norm3, out, batch)
-
-        return out
+        combined = sum(branch_outputs)
+        combined = combined + self.mlp(combined)
+        return self._apply_norm(self.norm3, combined, batch)
 
 
 class Encoder(torch.nn.Module):
-    """
-    Multi-layer graph encoder using GPSConv (local GCNConv + global Mamba).
-
-    Every GPSConv layer runs at a fixed `hidden_channels` width (required by
-    GPSConv's residual connections). Width schedule:
-      - 1 layer:  in_channels -> [GPSConv @ out_channels] -> out_channels
-      - k layers: in_channels -> [k x GPSConv @ 2*out_channels] -> Linear -> out_channels
-
-    Args:
-        in_channels:      Input feature size.
-        out_channels:     Output embedding size.
-        activation:       Activation applied after each GPSConv.
-        base_model:       Local MPNN constructor (default: GCNConv), must accept
-                           (channels, channels).
-        num_layers:       Total number of GPSConv layers.
-        dropout:          Dropout rate inside each GPSConv.
-        order_by_degree:  Sort nodes by degree before Mamba.
-        shuffle_ind:      Number of random permutation averages (0 = none).
-        d_state:          Mamba SSM state size.
-        d_conv:           Mamba conv kernel size.
-        bidirectional:    Give every GPSConv layer a backward Mamba scan too
-                           (see `GPSConv`).
-    """
-
     def __init__(
         self,
         in_channels: int,
@@ -252,14 +183,13 @@ class Encoder(torch.nn.Module):
 
         hidden_channels = out_channels if num_layers == 1 else 2 * out_channels
 
-        # Project raw node features into the working width
         self.input_proj = (
             nn.Identity()
             if in_channels == hidden_channels
             else nn.Linear(in_channels, hidden_channels)
         )
 
-        def _make_gps(channels: int) -> GPSConv:
+        def make_gps_layer(channels: int) -> GPSConv:
             return GPSConv(
                 channels=channels,
                 conv=base_model(channels, channels),
@@ -272,7 +202,7 @@ class Encoder(torch.nn.Module):
             )
 
         self.gps_layers = nn.ModuleList(
-            _make_gps(hidden_channels) for _ in range(num_layers)
+            make_gps_layer(hidden_channels) for _ in range(num_layers)
         )
 
         self._needs_output_proj = num_layers > 1
@@ -293,14 +223,6 @@ class Encoder(torch.nn.Module):
         edge_index: Tensor,
         batch: Tensor,
     ) -> Tensor:
-        """
-        Args:
-            node_features: (N, in_channels)
-            edge_index:    (2, E)
-            batch:         (N,)  graph-assignment vector
-        Returns:
-            Node embeddings of shape (N, out_channels)
-        """
         node_emb = self.input_proj(node_features)
 
         for layer in self.gps_layers:
@@ -313,18 +235,6 @@ class Encoder(torch.nn.Module):
 
 
 class _ProjectionMixin(torch.nn.Module):
-    """
-    Shared projection head and cosine-similarity helpers for MV/SV models.
-
-    Args:
-        num_hidden:       Dimensionality of the GNN encoder output.
-        num_proj_hidden:  Dimensionality of the projection head.
-        tau:              Temperature parameter for NT-Xent loss.
-
-    Returns:
-        Projection head and similarity helpers for contrastive loss computation.
-    """
-
     def __init__(self, num_hidden: int, num_proj_hidden: int, tau: float):
         super().__init__()
         self.tau = tau
@@ -336,13 +246,11 @@ class _ProjectionMixin(torch.nn.Module):
         return self.forward_proj_2(projected)
 
     def similarity_matrix(self, emb_a: Tensor, emb_b: Tensor) -> Tensor:
-        """Normalised dot-product similarity matrix."""
         return torch.mm(
             nn.functional.normalize(emb_a), nn.functional.normalize(emb_b).t()
         )
 
     def tau_scaling(self, sim: Tensor) -> Tensor:
-        """Temperature-scaled exponential (NT-Xent numerator/denominator)."""
         return torch.exp(sim / self.tau)
 
     def _reduce(self, per_node_loss: Tensor, mean: bool) -> Tensor:
@@ -356,16 +264,10 @@ class _ProjectionMixin(torch.nn.Module):
 
     @staticmethod
     def _positive_pair_counts(adj: Tensor) -> Tensor:
-        """2 * |N_i| + 1  (intra + inter neighbours + self inter-view)."""
         return torch.sum(adj, 1).mul(2).add(1).squeeze()
 
 
 class MVmodel(_ProjectionMixin):
-    """
-    Multi-view contrastive model with class-biased negative sampling.
-    `batch` is required because the Mamba encoder needs it.
-    """
-
     def __init__(
         self,
         encoder: Encoder,
@@ -389,11 +291,6 @@ class MVmodel(_ProjectionMixin):
         adj: Tensor,
         pseudo_labels: Tensor | None = None,
     ) -> Tensor:
-        """
-        Neighbour-aware NT-Xent term. When `pseudo_labels` is given, pairs
-        sharing a pseudo-label are excluded from the negative-pair denominator
-        (class-biased negative sampling); otherwise all non-self pairs count.
-        """
         adj = self._strip_self_loops(adj)
         positive_pair_counts = self._positive_pair_counts(adj)
 
@@ -433,11 +330,6 @@ class MVmodel(_ProjectionMixin):
 
 
 class SVmodel(_ProjectionMixin):
-    """
-    Single-view contrastive model.
-    `batch` is required because the Mamba encoder needs it.
-    """
-
     def __init__(
         self,
         encoder: Encoder,
@@ -494,7 +386,6 @@ class SVmodel(_ProjectionMixin):
 
 
 def drop_feature(node_features: Tensor, drop_prob: float) -> Tensor:
-    """Randomly zeros out feature dimensions with probability `drop_prob`."""
     drop_mask = (
         torch.empty(node_features.size(1), device=node_features.device).uniform_(0, 1)
         < drop_prob
@@ -517,11 +408,6 @@ def dropout_adj(
     force_undirected: bool = False,
     training: bool = True,
 ) -> tuple[Tensor, Tensor]:
-    """
-    Probability-weighted edge dropout: edge (u, v) is kept with probability
-    `1 - edge_attr[u, v]`. All work happens on `edge_index`/`edge_attr`'s own
-    device — callers are responsible for placing those tensors correctly.
-    """
     if not training:
         return edge_index, edge_attr
 
@@ -553,7 +439,6 @@ def multiple_dropout_average(
     force_undirected: bool = False,
     training: bool = True,
 ) -> tuple[Tensor, Tensor]:
-    """Thin wrapper around `dropout_adj` used to build each contrastive view."""
     if not training:
         return edge_index, edge_attr
     return dropout_adj(edge_index, edge_attr, force_undirected=force_undirected)

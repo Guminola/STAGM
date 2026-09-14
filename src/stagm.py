@@ -1,39 +1,26 @@
-# Standard Library
 import argparse
 from time import perf_counter
 
-# Scientific Stack & General Data Processing
 import numpy as np
-
-# Bioinformatics & Spatial Analysis
 import scanpy as sc
 import squidpy as sq
-
-# PyTorch & Deep Learning
 import torch
-
-# Scikit-learn: Metrics, Decomposition, and Preprocessing
 from scipy.sparse import csr_matrix, issparse
 from sklearn import metrics
 from sklearn.cluster import KMeans
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from torch import nn
 
-# PyTorch Geometric (Graph Neural Networks)
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 
 from .clustering import clustering
-
-# STAGM-specific modules
 from .model import Encoder, MVmodel, SVmodel, drop_feature, multiple_dropout_average
 
-# Only GCNConv is used as the local-MPNN branch inside GPSConv
 _ACTIVATIONS = {"relu": nn.functional.relu, "prelu": nn.PReLU()}
 
-# clustering.py only implements resolution search for these tools.
 _SUPPORTED_CLUSTER_TOOLS = ("leiden", "louvain")
 
 
@@ -70,94 +57,94 @@ def convert_edge_probabilities(
 
 
 class STAGM:
-    """
-    Trains and evaluates a GPSConv (local GCNConv + global Mamba SSM)
-    contrastive encoder on spatial transcriptomics data, then clusters the
-    resulting embedding via leiden/louvain resolution search.
-
-    Args:
-        args, config, single, refine, checkpoint_path: see original usage.
-        use_minibatch: True forces neighbor-sampled mini-batch training,
-            False forces the original full-graph training, None (default)
-            auto-selects based on `minibatch_node_threshold` so small
-            (e.g. Visium-scale) datasets keep the exact original training
-            path and behaviour, while large (e.g. Xenium-scale) datasets
-            train in mini-batches instead of materialising an N x N
-            similarity/adjacency matrix.
-        minibatch_size: Number of seed nodes sampled per mini-batch.
-        minibatch_num_neighbors: Per-hop neighbor sampling fanout, one
-            entry per GPSConv layer. Defaults to `[-1] * num_layers`
-            (take every neighbor at each hop), which is exact rather than
-            approximate given the underlying graph's small, bounded degree.
-        minibatch_node_threshold: Node-count cutoff used when
-            `use_minibatch=None` to decide whether to mini-batch.
-    """
-
     def __init__(
         self,
         args: argparse.Namespace,
-        config: dict,
-        single: bool = False,
-        refine: bool = True,
-        checkpoint_path: str = "model.pt",
-        use_minibatch: bool | None = None,
-        minibatch_size: int = 4096,
-        minibatch_num_neighbors: list[int] | None = None,
-        minibatch_node_threshold: int = 20000,
+        config: argparse.Namespace,
     ) -> None:
         self.args = args
-        self.single = single
         self.config = config
-        self.checkpoint_path = checkpoint_path
 
-        self.learning_rate: float = config.learning_rate
-        self.num_hidden: int = config.num_hidden
-        self.num_proj_hidden: int = config.num_proj_hidden
-        self.activation = _ACTIVATIONS[config.activation]
-        self.num_layers: int = config.num_layers
-        self.drop_feature_rate_1: float = config.drop_feature_rate_1
-        self.drop_feature_rate_2: float = config.drop_feature_rate_2
-        self.tau: float = config.tau
-        self.num_epochs: int = config.num_epochs
-        self.weight_decay: float = config.weight_decay
-        self.num_clusters: int = config.num_clusters
-        self.num_gene: int = config.num_gene
-        self.refine = refine
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Model architecture
+        self.num_gene: int = getattr(config, "num_gene", 3000)
+        self.num_hidden: int = getattr(config, "num_hidden", 128)
+        self.num_proj_hidden: int = getattr(config, "num_proj_hidden", 128)
+        self.num_layers: int = getattr(config, "num_layers", 2)
+        self.num_clusters: int = getattr(config, "num_clusters", 7)
+        self.k: int | None = getattr(config, "k", None)
+        self.activation = _ACTIVATIONS[getattr(config, "activation", "relu")]
 
-        self.radius: int = 15
-        self.tool: str = "leiden"  # supported: "leiden", "louvain"
-        self.mask_slices: bool = True
-        self.bar_format: str = (
-            "{l_bar}{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+        # Encoder options
+        self.base_model = getattr(config, "base_model", GCNConv)
+        self.dropout: float = getattr(config, "dropout", 0.0)
+        self.shuffle_ind: bool = getattr(config, "shuffle_ind", False)
+        self.d_state: int = getattr(config, "d_state", 16)
+        self.d_conv: int = getattr(config, "d_conv", 4)
+        self.order_by_degree: bool = getattr(config, "order_by_degree", False)
+        self.bidirectional: bool = getattr(config, "bidirectional", True)
+
+        # Training hyperparameters
+        self.learning_rate: float = getattr(config, "learning_rate", 1e-3)
+        self.weight_decay: float = getattr(config, "weight_decay", 0.0)
+        self.num_epochs: int = getattr(config, "num_epochs", 200)
+        self.tau: float = getattr(config, "tau", 0.5)
+        self.drop_feature_rate_1: float = getattr(config, "drop_feature_rate_1", 0.3)
+        self.drop_feature_rate_2: float = getattr(config, "drop_feature_rate_2", 0.4)
+
+        # Experiment / runtime options
+        self.single: bool = getattr(config, "single", False)
+        self.refine: bool = getattr(config, "refine", True)
+        self.checkpoint_path: str = getattr(config, "checkpoint_path", "model.pt")
+
+        # Mini-batch options
+        self.use_minibatch: bool | None = getattr(config, "use_minibatch", None)
+        self.minibatch_size: int = getattr(config, "minibatch_size", 4096)
+        self.minibatch_num_neighbors: list[int] | None = getattr(
+            config, "minibatch_num_neighbors", None
+        )
+        self.minibatch_node_threshold: int = getattr(
+            config, "minibatch_node_threshold", 20_000
         )
 
-        self.use_minibatch = use_minibatch
-        self.minibatch_size = minibatch_size
-        self.minibatch_num_neighbors = minibatch_num_neighbors
-        self.minibatch_node_threshold = minibatch_node_threshold
+        # Clustering options
+        self.radius: int = getattr(config, "radius", 15)
+        self.tool: str = getattr(config, "tool", "leiden")
+        self.mask_slices: bool = getattr(config, "mask_slices", True)
 
+        # Progress-bar style
+        self.bar_format: str = getattr(
+            config,
+            "bar_format",
+            "{l_bar}{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        )
+
+        # Derived / runtime state
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.adata = None
         self._loss_curve: list[float] = []
         self._training_time_seconds: float | None = None
 
+        # Model, projection head, optimizer
         self.encoder = Encoder(
-            self.num_gene,
-            self.num_hidden,
-            self.activation,
-            base_model=GCNConv,
+            in_channels=self.num_gene,
+            out_channels=self.num_hidden,
+            activation=self.activation,
+            base_model=self.base_model,
             num_layers=self.num_layers,
-            dropout=self.config.dropout,
-            shuffle_ind=self.config.shuffle_ind,
-            d_state=self.config.d_state,
-            d_conv=self.config.d_conv,
-            order_by_degree=self.config.order_by_degree,
-            bidirectional=getattr(self.config, "bidirectional", True),
+            dropout=self.dropout,
+            order_by_degree=self.order_by_degree,
+            shuffle_ind=self.shuffle_ind,
+            d_state=self.d_state,
+            d_conv=self.d_conv,
+            bidirectional=self.bidirectional,
         ).to(self.device)
 
-        model_cls = SVmodel if single else MVmodel
+        model_cls = SVmodel if self.single else MVmodel
         self.model = model_cls(
-            self.encoder, self.num_hidden, self.num_proj_hidden, self.tau
+            self.encoder,
+            self.num_hidden,
+            self.num_proj_hidden,
+            self.tau,
         ).to(self.device)
 
         self.optimizer = torch.optim.Adam(
@@ -166,7 +153,6 @@ class STAGM:
             weight_decay=self.weight_decay,
         )
 
-    # Shared graph loading
     def _load_graph_structure(self) -> tuple[object, torch.Tensor]:
         if self.adata is None:
             raise ValueError("adata not loaded!")
@@ -177,7 +163,6 @@ class STAGM:
     def _prepare_graph_tensors(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Load feature/graph tensors from self.adata onto self.device (full graph)."""
         features_matrix = torch.FloatTensor(self.adata.obsm["feat"].copy()).to(
             self.device
         )
@@ -191,18 +176,14 @@ class STAGM:
         return features_matrix, graph_neigh, edge_index, batch
 
     def _positive_pseudo_labels(self, to_device: bool = True) -> torch.Tensor:
-        """Fetch/derive per-node pseudo labels used by MVmodel's biased loss."""
         if "pseudo_labels" in self.adata.obs:
             pseudo_labels = torch.as_tensor(self.adata.obs["pseudo_labels"].cat.codes)
-        elif self.config.k:
-            pseudo_labels = generate_pseudo_labels(
-                self.adata.obsm["img_emb"], self.config.k
-            )
+        elif self.k:
+            pseudo_labels = generate_pseudo_labels(self.adata.obsm["img_emb"], self.k)
         else:
             pseudo_labels = generate_pseudo_labels(self.adata.obsm["img_emb"])
         return pseudo_labels.to(self.device) if to_device else pseudo_labels
 
-    # Training / evaluation
     def train(self) -> None:
         n_nodes = self.adata.obsm["feat"].shape[0]
         use_minibatch = self.use_minibatch
@@ -459,7 +440,6 @@ class STAGM:
         )
         print("=======================================\n")
 
-    # Clustering / metrics
     def cluster(self, label: bool = True) -> None:
         if self.tool not in _SUPPORTED_CLUSTER_TOOLS:
             raise ValueError(
@@ -481,26 +461,29 @@ class STAGM:
 
         if label:
             print("calculate metric ARI")
-            ARI = metrics.adjusted_rand_score(
+            ari = metrics.adjusted_rand_score(
                 self.adata.obs["domain"], self.adata.obs["ground_truth"]
             )
-            NMI = metrics.normalized_mutual_info_score(
+            nmi = metrics.normalized_mutual_info_score(
                 self.adata.obs["domain"], self.adata.obs["ground_truth"]
             )
-            self.adata.uns["ari"] = ARI
-            self.adata.uns["nmi"] = NMI
-            print("ARI:", ARI)
-            print("NMI:", NMI)
+            self.adata.uns["ari"] = ari
+            self.adata.uns["nmi"] = nmi
+            print("ARI:", ari)
+            print("NMI:", nmi)
         else:
             print("calculate SC and DB")
-            SC = silhouette_score(self.adata.obsm["emb"], self.adata.obs["domain"])
-            DB = davies_bouldin_score(self.adata.obsm["emb"], self.adata.obs["domain"])
-            self.adata.uns["sc"] = SC
-            self.adata.uns["db"] = DB
-            print("SC:", SC)
-            print("DB:", DB)
+            sc_score = silhouette_score(
+                self.adata.obsm["emb"], self.adata.obs["domain"]
+            )
+            db_score = davies_bouldin_score(
+                self.adata.obsm["emb"], self.adata.obs["domain"]
+            )
+            self.adata.uns["sc"] = sc_score
+            self.adata.uns["db"] = db_score
+            print("SC:", sc_score)
+            print("DB:", db_score)
 
-    # Visualization
     def draw_spatial(self, p: str = "") -> None:
         sq.pl.spatial_scatter(
             self.adata,

@@ -1,8 +1,5 @@
-# # ============================================================================
-# # mamba-ssm dev environment for RTX 5070 (Blackwell / sm_120)
-# # Base: CUDA 12.9 devel image (matches the "cu129"-built accelerator wheels)
-# # Conda env: stagm-env, Python 3.12 (required by the cp312 wheels below)
-# # ============================================================================
+# mamba-ssm dev environment for RTX 5070 (Blackwell / sm_120)
+# Base: CUDA 12.9 devel image (matches the "cu129"-built accelerator wheels)
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 

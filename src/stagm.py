@@ -85,9 +85,9 @@ class STAGM:
 
         # Training hyperparameters
         self.learning_rate: float = getattr(config, "learning_rate", 1e-3)
-        self.weight_decay: float = getattr(config, "weight_decay", 0.0)
+        self.weight_decay: float = getattr(config, "weight_decay", 1e-04)
         self.num_epochs: int = getattr(config, "num_epochs", 200)
-        self.tau: float = getattr(config, "tau", 0.5)
+        self.tau: float = getattr(config, "tau", 30)
         self.drop_feature_rate_1: float = getattr(config, "drop_feature_rate_1", 0.3)
         self.drop_feature_rate_2: float = getattr(config, "drop_feature_rate_2", 0.4)
 
@@ -504,7 +504,7 @@ class STAGM:
     def draw_xenium_spatial(
         self,
         color: str | list[str] = "domain",
-        size: float = 2.0,
+        size: float = 1.0,
         dpi: int = 200,
         p: str = "",
     ) -> None:

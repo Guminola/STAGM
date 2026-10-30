@@ -4,12 +4,11 @@ from typing import Any
 import torch
 from mamba_ssm import Mamba as Mamba
 from torch import nn
-
 from torch_geometric.nn import GCNConv, MessagePassing
 from torch_geometric.nn.inits import reset
 from torch_geometric.nn.resolver import activation_resolver, normalization_resolver
 from torch_geometric.typing import Adj, OptTensor, Tensor
-from torch_geometric.utils import degree, sort_edge_index, to_dense_batch
+from torch_geometric.utils import to_dense_batch
 
 
 def _permute_within_batch(node_features: Tensor, batch: Tensor) -> Tensor:
@@ -37,32 +36,19 @@ class GPSConv(torch.nn.Module):
         act_kwargs: dict[str, Any] | None = None,
         norm: str | None = "batch_norm",
         norm_kwargs: dict[str, Any] | None = None,
-        order_by_degree: bool = False,
-        shuffle_ind: int = 0,
         d_state: int = 16,
         d_conv: int = 4,
-        bidirectional: bool = False,
     ):
         super().__init__()
-
-        assert not (order_by_degree and shuffle_ind != 0), (
-            f"order_by_degree={order_by_degree} and shuffle_ind={shuffle_ind} "
-            "are mutually exclusive"
-        )
 
         self.channels = channels
         self.conv = conv
         self.dropout = dropout
-        self.order_by_degree = order_by_degree
-        self.shuffle_ind = shuffle_ind
-        self.bidirectional = bidirectional
-
         self.mamba = Mamba(d_model=channels, d_state=d_state, d_conv=d_conv, expand=1)
-        if self.bidirectional:
-            self.mamba_rev = Mamba(
-                d_model=channels, d_state=d_state, d_conv=d_conv, expand=1
-            )
-            self.bidirectional_proj = nn.Linear(channels * 2, channels)
+        self.mamba_rev = Mamba(
+            d_model=channels, d_state=d_state, d_conv=d_conv, expand=1
+        )
+        self.bidirectional_proj = nn.Linear(channels * 2, channels)
 
         self.mlp = nn.Sequential(
             nn.Linear(channels, channels * 2),
@@ -86,8 +72,7 @@ class GPSConv(torch.nn.Module):
         if self.conv is not None:
             self.conv.reset_parameters()
         reset(self.mlp)
-        if self.bidirectional:
-            self.bidirectional_proj.reset_parameters()
+        self.bidirectional_proj.reset_parameters()
         for norm in (self.norm1, self.norm2, self.norm3):
             if norm is not None:
                 norm.reset_parameters()
@@ -95,9 +80,6 @@ class GPSConv(torch.nn.Module):
     def _run_mamba(self, node_features: Tensor, batch: Tensor) -> Tensor:
         dense, mask = to_dense_batch(node_features, batch)
         forward_out = self.mamba(dense)[mask]
-
-        if not self.bidirectional:
-            return forward_out
 
         rev_idx = _reverse_within_batch(batch)
         dense_rev, mask_rev = to_dense_batch(node_features[rev_idx], batch[rev_idx])
@@ -120,12 +102,15 @@ class GPSConv(torch.nn.Module):
         node_features: Tensor,
         edge_index: Adj,
         batch: Tensor,
+        edge_weight: OptTensor = None,
         **kwargs,
     ) -> Tensor:
         branch_outputs = []
 
         if self.conv is not None:
-            local_out = self.conv(node_features, edge_index, **kwargs)
+            local_out = self.conv(
+                node_features, edge_index, edge_weight=edge_weight, **kwargs
+            )
             local_out = nn.functional.dropout(
                 local_out, p=self.dropout, training=self.training
             )
@@ -134,19 +119,7 @@ class GPSConv(torch.nn.Module):
             branch_outputs.append(local_out)
 
         mamba_input = node_features
-        if self.order_by_degree:
-            node_degree = degree(edge_index[0], mamba_input.size(0)).to(torch.long)
-            order_tensor = torch.stack([batch, node_degree], dim=1).T
-            _, mamba_input = sort_edge_index(order_tensor, edge_attr=mamba_input)
-
-        if self.shuffle_ind == 0:
-            global_out = self._run_mamba(mamba_input, batch)
-        else:
-            shuffled_outputs = []
-            for _ in range(self.shuffle_ind):
-                perm = _permute_within_batch(mamba_input, batch)
-                shuffled_outputs.append(self._run_mamba(mamba_input[perm], batch)[perm])
-            global_out = sum(shuffled_outputs) / self.shuffle_ind
+        global_out = self._run_mamba(mamba_input, batch)
 
         global_out = nn.functional.dropout(
             global_out, p=self.dropout, training=self.training
@@ -166,14 +139,10 @@ class Encoder(torch.nn.Module):
         in_channels: int,
         out_channels: int,
         activation,
-        base_model=GCNConv,
         num_layers: int = 2,
         dropout: float = 0.0,
-        order_by_degree: bool = False,
-        shuffle_ind: int = 0,
         d_state: int = 16,
         d_conv: int = 4,
-        bidirectional: bool = False,
     ):
         super().__init__()
         assert num_layers >= 1
@@ -192,13 +161,10 @@ class Encoder(torch.nn.Module):
         def make_gps_layer(channels: int) -> GPSConv:
             return GPSConv(
                 channels=channels,
-                conv=base_model(channels, channels),
+                conv=GCNConv(channels, channels),
                 dropout=dropout,
-                order_by_degree=order_by_degree,
-                shuffle_ind=shuffle_ind,
                 d_state=d_state,
                 d_conv=d_conv,
-                bidirectional=bidirectional,
             )
 
         self.gps_layers = nn.ModuleList(
@@ -222,11 +188,14 @@ class Encoder(torch.nn.Module):
         node_features: Tensor,
         edge_index: Tensor,
         batch: Tensor,
+        edge_weight: OptTensor = None,
     ) -> Tensor:
         node_emb = self.input_proj(node_features)
 
         for layer in self.gps_layers:
-            node_emb = self.activation(layer(node_emb, edge_index, batch))
+            node_emb = self.activation(
+                layer(node_emb, edge_index, batch, edge_weight=edge_weight)
+            )
 
         if self._needs_output_proj:
             node_emb = self.output_proj(node_emb)
@@ -279,9 +248,15 @@ class MVmodel(_ProjectionMixin):
         self.encoder = encoder
 
     def forward(
-        self, node_features: Tensor, edge_index: Tensor, batch: Tensor
+        self,
+        node_features: Tensor,
+        edge_index: Tensor,
+        batch: Tensor,
+        edge_weight: OptTensor = None,
     ) -> Tensor:
-        gnn_embedding = self.encoder(node_features, edge_index, batch)
+        gnn_embedding = self.encoder(
+            node_features, edge_index, batch, edge_weight=edge_weight
+        )
         return self.projection(gnn_embedding)
 
     def _neighbor_contrastive_term(
@@ -310,7 +285,9 @@ class MVmodel(_ProjectionMixin):
         numerator = (
             inter_sim.diag() + intra_sim.mul(adj).sum(1) + inter_sim.mul(adj).sum(1)
         )
-        denominator = intra_sim_denom.sum(1) + inter_sim_denom.sum(1) - intra_sim.diag()
+        denominator = (
+            intra_sim_denom.sum(1) + inter_sim_denom.sum(1) - intra_sim_denom.diag()
+        )
 
         return -torch.log((numerator / denominator) / positive_pair_counts)
 
@@ -341,9 +318,15 @@ class SVmodel(_ProjectionMixin):
         self.encoder = encoder
 
     def forward(
-        self, node_features: Tensor, edge_index: Tensor, batch: Tensor
+        self,
+        node_features: Tensor,
+        edge_index: Tensor,
+        batch: Tensor,
+        edge_weight: OptTensor = None,
     ) -> Tensor:
-        gnn_embedding = self.encoder(node_features, edge_index, batch)
+        gnn_embedding = self.encoder(
+            node_features, edge_index, batch, edge_weight=edge_weight
+        )
         return self.projection(gnn_embedding)
 
     def _neighbor_contrastive_term(
@@ -431,6 +414,24 @@ def dropout_adj(
         edge_index = torch.stack([row, col], dim=0)
 
     return edge_index, edge_attr
+
+
+def symmetrize_edge_attr(
+    edge_index: Tensor, edge_attr: Tensor
+) -> tuple[Tensor, Tensor]:
+    row, col = edge_index
+    upper_tri_mask = row <= col
+    row, col, edge_attr = (
+        row[upper_tri_mask],
+        col[upper_tri_mask],
+        edge_attr[upper_tri_mask],
+    )
+    edge_index = torch.stack([torch.cat([row, col]), torch.cat([col, row])], dim=0)
+    return edge_index, torch.cat([edge_attr, edge_attr], dim=0)
+
+
+def edge_weight_from_probabilities(edge_attr: Tensor) -> Tensor:
+    return 1.0 - edge_attr
 
 
 def multiple_dropout_average(

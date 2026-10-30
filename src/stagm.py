@@ -10,14 +10,20 @@ from sklearn import metrics
 from sklearn.cluster import KMeans
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from torch import nn
-
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 
 from .clustering import clustering
-from .model import Encoder, MVmodel, SVmodel, drop_feature, multiple_dropout_average
+from .model import (
+    Encoder,
+    MVmodel,
+    SVmodel,
+    drop_feature,
+    edge_weight_from_probabilities,
+    multiple_dropout_average,
+    symmetrize_edge_attr,
+)
 
 _ACTIVATIONS = {"relu": nn.functional.relu, "prelu": nn.PReLU()}
 
@@ -49,6 +55,14 @@ def adj_to_edge_index(adj) -> torch.Tensor:
     return _sparse_to_edge_index(csr_matrix(adj))
 
 
+def edge_attr_for_index(matrix, edge_index: torch.Tensor) -> torch.Tensor:
+    matrix = matrix.tocsr() if issparse(matrix) else csr_matrix(matrix)
+    row = np.array(edge_index[0].cpu().numpy(), dtype=np.int64)
+    col = np.array(edge_index[1].cpu().numpy(), dtype=np.int64)
+    values = np.asarray(matrix[row, col]).ravel()
+    return torch.as_tensor(values, dtype=torch.float32)
+
+
 def convert_edge_probabilities(
     adj_matrix: torch.Tensor, edge_prob_matrix: torch.Tensor
 ) -> torch.Tensor:
@@ -69,19 +83,15 @@ class STAGM:
         self.num_gene: int = getattr(config, "num_gene", 3000)
         self.num_hidden: int = getattr(config, "num_hidden", 128)
         self.num_proj_hidden: int = getattr(config, "num_proj_hidden", 128)
-        self.num_layers: int = getattr(config, "num_layers", 2)
+        self.num_layers: int = getattr(config, "num_layers", 1)
         self.num_clusters: int = getattr(config, "num_clusters", 7)
         self.k: int | None = getattr(config, "k", None)
         self.activation = _ACTIVATIONS[getattr(config, "activation", "relu")]
 
         # Encoder options
-        self.base_model = getattr(config, "base_model", GCNConv)
         self.dropout: float = getattr(config, "dropout", 0.0)
-        self.shuffle_ind: bool = getattr(config, "shuffle_ind", False)
         self.d_state: int = getattr(config, "d_state", 16)
         self.d_conv: int = getattr(config, "d_conv", 4)
-        self.order_by_degree: bool = getattr(config, "order_by_degree", False)
-        self.bidirectional: bool = getattr(config, "bidirectional", True)
 
         # Training hyperparameters
         self.learning_rate: float = getattr(config, "learning_rate", 1e-3)
@@ -129,14 +139,10 @@ class STAGM:
             in_channels=self.num_gene,
             out_channels=self.num_hidden,
             activation=self.activation,
-            base_model=self.base_model,
             num_layers=self.num_layers,
             dropout=self.dropout,
-            order_by_degree=self.order_by_degree,
-            shuffle_ind=self.shuffle_ind,
             d_state=self.d_state,
             d_conv=self.d_conv,
-            bidirectional=self.bidirectional,
         ).to(self.device)
 
         model_cls = SVmodel if self.single else MVmodel
@@ -223,17 +229,27 @@ class STAGM:
             self.model.train()
             self.optimizer.zero_grad()
 
-            edge_index_1, _ = multiple_dropout_average(
+            edge_index_1, edge_attr_1 = multiple_dropout_average(
                 edge_index, edge_probs, force_undirected=True
             )
-            edge_index_2, _ = multiple_dropout_average(
+            edge_index_2, edge_attr_2 = multiple_dropout_average(
                 edge_index, edge_probs, force_undirected=True
             )
             x_1 = drop_feature(features_matrix, self.drop_feature_rate_1)
             x_2 = drop_feature(features_matrix, self.drop_feature_rate_2)
 
-            z1 = self.model(x_1, edge_index_1, batch)
-            z2 = self.model(x_2, edge_index_2, batch)
+            z1 = self.model(
+                x_1,
+                edge_index_1,
+                batch,
+                edge_weight=edge_weight_from_probabilities(edge_attr_1),
+            )
+            z2 = self.model(
+                x_2,
+                edge_index_2,
+                batch,
+                edge_weight=edge_weight_from_probabilities(edge_attr_2),
+            )
 
             if self.single:
                 loss = self.model.contrastive_loss(
@@ -293,16 +309,12 @@ class STAGM:
             for sub in loader:
                 self.optimizer.zero_grad()
 
-                n_id = sub.n_id.numpy()
+                n_id = np.array(sub.n_id.numpy())
                 num_seed = sub.batch_size
 
-                global_row = n_id[sub.edge_index[0].numpy()]
-                global_col = n_id[sub.edge_index[1].numpy()]
-                edge_probs_sub = torch.as_tensor(
-                    np.asarray(edge_probabilities[global_row, global_col]).ravel(),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
+                edge_probs_sub = edge_attr_for_index(
+                    edge_probabilities, sub.n_id[sub.edge_index]
+                ).to(self.device)
 
                 x = sub.x.to(self.device)
                 sub_edge_index = sub.edge_index.to(self.device)
@@ -330,17 +342,27 @@ class STAGM:
                 else:
                     pseudo_labels = pseudo_labels_full[n_id[:num_seed]].to(self.device)
 
-                edge_index_1, _ = multiple_dropout_average(
+                edge_index_1, edge_attr_1 = multiple_dropout_average(
                     sub_edge_index, edge_probs_sub, force_undirected=True
                 )
-                edge_index_2, _ = multiple_dropout_average(
+                edge_index_2, edge_attr_2 = multiple_dropout_average(
                     sub_edge_index, edge_probs_sub, force_undirected=True
                 )
                 x_1 = drop_feature(x, self.drop_feature_rate_1)
                 x_2 = drop_feature(x, self.drop_feature_rate_2)
 
-                z1_full = self.model(x_1, edge_index_1, sub_batch)
-                z2_full = self.model(x_2, edge_index_2, sub_batch)
+                z1_full = self.model(
+                    x_1,
+                    edge_index_1,
+                    sub_batch,
+                    edge_weight=edge_weight_from_probabilities(edge_attr_1),
+                )
+                z2_full = self.model(
+                    x_2,
+                    edge_index_2,
+                    sub_batch,
+                    edge_weight=edge_weight_from_probabilities(edge_attr_2),
+                )
                 z1 = z1_full[:num_seed]
                 z2 = z2_full[:num_seed]
 
@@ -371,13 +393,25 @@ class STAGM:
             self.device
         )
         _, edge_index = self._load_graph_structure()
+        edge_probs = edge_attr_for_index(
+            self.adata.obsm["edge_probabilities"], edge_index
+        ).to(self.device)
+        edge_index, edge_probs = symmetrize_edge_attr(edge_index, edge_probs)
         batch = torch.zeros(
             features_matrix.size(0), dtype=torch.long, device=self.device
         )
 
         with torch.no_grad():
             self.adata.obsm["emb"] = (
-                self.model(features_matrix, edge_index, batch).detach().cpu().numpy()
+                self.model(
+                    features_matrix,
+                    edge_index,
+                    batch,
+                    edge_weight=edge_weight_from_probabilities(edge_probs),
+                )
+                .detach()
+                .cpu()
+                .numpy()
             )
 
         self._print_diagnostics()
@@ -549,4 +583,3 @@ class STAGM:
         sq.pl.spatial_scatter(adata_batch_0, color="domain", save="0.png")
 
         adata_batch_1 = self.adata[self.adata.obs["batch"] == "1", :]
-        sq.pl.spatial_scatter(adata_batch_1, color="domain", save="1.png")

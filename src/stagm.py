@@ -89,15 +89,15 @@ class STAGM:
         self.activation = _ACTIVATIONS[getattr(config, "activation", "relu")]
 
         # Encoder options
-        self.dropout: float = getattr(config, "dropout", 0.0)
+        self.dropout: float = getattr(config, "dropout", 0.2)
         self.d_state: int = getattr(config, "d_state", 16)
         self.d_conv: int = getattr(config, "d_conv", 4)
 
         # Training hyperparameters
-        self.learning_rate: float = getattr(config, "learning_rate", 1e-3)
+        self.learning_rate: float = getattr(config, "learning_rate", 1e-4)
         self.weight_decay: float = getattr(config, "weight_decay", 1e-04)
         self.num_epochs: int = getattr(config, "num_epochs", 200)
-        self.tau: float = getattr(config, "tau", 30)
+        self.tau: float = getattr(config, "tau", 40)
         self.drop_feature_rate_1: float = getattr(config, "drop_feature_rate_1", 0.3)
         self.drop_feature_rate_2: float = getattr(config, "drop_feature_rate_2", 0.4)
 
@@ -524,7 +524,7 @@ class STAGM:
             size=1.2,
             figsize=(7, 7),
             color=["ground_truth", "domain"],
-            save=p + str(self.args.slide) + ".png",
+            save=p + str(self.args.slide) + ".pdf",
         )
 
     def draw_single_spatial(self) -> None:
@@ -532,7 +532,7 @@ class STAGM:
             self.adata,
             color="domain",
             size=100,
-            save=str(self.args.slide) + ".png",
+            save=str(self.args.slide) + ".pdf",
         )
 
     def draw_xenium_spatial(
@@ -557,7 +557,7 @@ class STAGM:
             size=size,
             dpi=dpi,
             figsize=(7, 7),
-            save=p + str(self.args.slide) + "_xenium.png",
+            save=p + str(self.args.slide) + "_xenium.pdf",
         )
 
     def draw_umap(self) -> None:
@@ -580,6 +580,6 @@ class STAGM:
 
     def draw_horizontal(self) -> None:
         adata_batch_0 = self.adata[self.adata.obs["batch"] == "0", :]
-        sq.pl.spatial_scatter(adata_batch_0, color="domain", save="0.png")
+        sq.pl.spatial_scatter(adata_batch_0, color="domain", save="0.pdf")
 
         adata_batch_1 = self.adata[self.adata.obs["batch"] == "1", :]

@@ -9,6 +9,7 @@
 figures/
 Dataset/
 STAIG/
+SpaGCN/
 src/__pycache__/
 src/backup/
 

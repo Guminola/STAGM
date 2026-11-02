@@ -539,7 +539,7 @@ class STAGM:
         self,
         color: str | list[str] = "domain",
         size: float = 1.0,
-        dpi: int = 200,
+        dpi: int = 1000,
         p: str = "",
     ) -> None:
         n_cells = self.adata.n_obs

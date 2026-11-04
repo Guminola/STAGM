@@ -16,6 +16,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from tqdm import tqdm
 
+from .adata_processing import hilbert_rank
 from .clustering import clustering
 from .model import (
     Encoder,
@@ -121,6 +122,10 @@ class STAGM:
         self.checkpoint_path: str = getattr(config, "checkpoint_path", "model.pt")
         self.seed: int | None = getattr(config, "seed", 0)
         self.recalibrate_norm: bool = getattr(config, "recalibrate_norm", True)
+        self.use_hilbert: bool = getattr(config, "use_hilbert", False)
+        self.hilbert_bits: int = getattr(config, "hilbert_bits", 16)
+        self.spatial_key: str = getattr(config, "spatial_key", "spatial")
+        self.hilbert_slice_key: str = getattr(config, "hilbert_slice_key", "batch")
 
         # Mini-batch options
         self.use_minibatch: bool | None = getattr(config, "use_minibatch", None)
@@ -215,6 +220,31 @@ class STAGM:
         )
         return features_matrix, graph_neigh, edge_index, batch
 
+    def _hilbert_rank(self) -> np.ndarray | None:
+        if not self.use_hilbert:
+            return None
+        if self.spatial_key not in self.adata.obsm:
+            raise KeyError(
+                f"use_hilbert=True needs spatial coordinates in "
+                f"adata.obsm['{self.spatial_key}']."
+            )
+        groups = None
+        if self.hilbert_slice_key in self.adata.obs:
+            groups = self.adata.obs[self.hilbert_slice_key].astype(str).to_numpy()
+        rank = hilbert_rank(
+            np.asarray(self.adata.obsm[self.spatial_key]),
+            groups=groups,
+            bits=self.hilbert_bits,
+        )
+        self.adata.obs["hilbert_rank"] = rank
+        return rank
+
+    def _sequence_order(self) -> torch.Tensor | None:
+        rank = self._hilbert_rank()
+        if rank is None:
+            return None
+        return torch.from_numpy(np.argsort(rank, kind="stable")).to(self.device)
+
     def _positive_pseudo_labels(self, to_device: bool = True) -> torch.Tensor:
         if "pseudo_labels" in self.adata.obs:
             pseudo_labels = torch.as_tensor(self.adata.obs["pseudo_labels"].cat.codes)
@@ -254,6 +284,10 @@ class STAGM:
         else:
             pseudo_labels = self._positive_pseudo_labels()
 
+        order = self._sequence_order()
+        if order is not None:
+            print("Mamba sequence order: Hilbert curve")
+
         self._loss_curve = []
         train_start = perf_counter()
 
@@ -276,12 +310,14 @@ class STAGM:
                 edge_index_1,
                 batch,
                 edge_weight=sampled_edge_weight(edge_attr_1),
+                order=order,
             )
             z2 = self.model(
                 x_2,
                 edge_index_2,
                 batch,
                 edge_weight=sampled_edge_weight(edge_attr_2),
+                order=order,
             )
 
             if self.single:
@@ -332,6 +368,11 @@ class STAGM:
         if self.single and self.mask_slices and "batch" in self.adata.obs:
             same_slice = self.adata.obs["batch"].astype(str).to_numpy()
 
+        rank_full = self._hilbert_rank()
+        rank_tensor = None if rank_full is None else torch.from_numpy(rank_full)
+        if rank_tensor is not None:
+            print("Mamba sequence order: Hilbert curve")
+
         self._loss_curve = []
         train_start = perf_counter()
 
@@ -352,6 +393,13 @@ class STAGM:
                 x = sub.x.to(self.device)
                 sub_edge_index = sub.edge_index.to(self.device)
                 sub_batch = torch.zeros(x.size(0), dtype=torch.long, device=self.device)
+                sub_order = (
+                    None
+                    if rank_tensor is None
+                    else torch.argsort(rank_tensor[sub.n_id], stable=True).to(
+                        self.device
+                    )
+                )
 
                 seed_mask = (sub_edge_index[0] < num_seed) & (
                     sub_edge_index[1] < num_seed
@@ -389,12 +437,14 @@ class STAGM:
                     edge_index_1,
                     sub_batch,
                     edge_weight=sampled_edge_weight(edge_attr_1),
+                    order=sub_order,
                 )
                 z2_full = self.model(
                     x_2,
                     edge_index_2,
                     sub_batch,
                     edge_weight=sampled_edge_weight(edge_attr_2),
+                    order=sub_order,
                 )
                 z1 = z1_full[:num_seed]
                 z2 = z2_full[:num_seed]
@@ -437,15 +487,22 @@ class STAGM:
         )
 
         edge_weight = edge_weight_from_probabilities(edge_probs)
+        order = self._sequence_order()
 
         if self.recalibrate_norm:
             self._recalibrate_norm_stats(
-                features_matrix, edge_index, batch, edge_weight
+                features_matrix, edge_index, batch, edge_weight, order=order
             )
 
         with torch.no_grad():
             emb = (
-                self.model(features_matrix, edge_index, batch, edge_weight=edge_weight)
+                self.model(
+                    features_matrix,
+                    edge_index,
+                    batch,
+                    edge_weight=edge_weight,
+                    order=order,
+                )
                 .detach()
                 .cpu()
                 .numpy()
@@ -462,6 +519,7 @@ class STAGM:
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         edge_weight: torch.Tensor,
+        order: torch.Tensor | None = None,
     ) -> None:
         norms = [m for m in self.model.modules() if isinstance(m, _BatchNorm)]
         if not norms:
@@ -474,7 +532,13 @@ class STAGM:
             norm.train()
 
         with torch.no_grad():
-            self.model(features_matrix, edge_index, batch, edge_weight=edge_weight)
+            self.model(
+                features_matrix,
+                edge_index,
+                batch,
+                edge_weight=edge_weight,
+                order=order,
+            )
 
         for norm, momentum in zip(norms, momenta):
             norm.momentum = momentum

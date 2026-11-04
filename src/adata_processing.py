@@ -25,6 +25,69 @@ def generate_pseudo_labels(img_emb: np.ndarray, n_clusters: int) -> np.ndarray:
     return KMeans(n_clusters=n_clusters, random_state=0).fit(img_emb).labels_
 
 
+def hilbert_index_2d(coords: np.ndarray, bits: int = 16) -> np.ndarray:
+    if not 1 <= bits <= 31:
+        raise ValueError("bits must be between 1 and 31")
+    coords = np.asarray(coords, dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError("coords must have shape (n_cells, >=2)")
+    coords = coords[:, :2]
+    if coords.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    if not np.isfinite(coords).all():
+        raise ValueError("coords contain NaN or infinite values")
+
+    side = 1 << bits
+    mins = coords.min(axis=0)
+    span = float((coords.max(axis=0) - mins).max())
+    if span == 0.0:
+        return np.zeros(coords.shape[0], dtype=np.int64)
+
+    grid = np.floor((coords - mins) / span * (side - 1)).astype(np.int64)
+    x, y = grid[:, 0], grid[:, 1]
+    index = np.zeros(coords.shape[0], dtype=np.int64)
+
+    step = side >> 1
+    while step > 0:
+        rx = (x & step) > 0
+        ry = (y & step) > 0
+        index += step * step * ((3 * rx.astype(np.int64)) ^ ry.astype(np.int64))
+        flip = rx & ~ry
+        x = np.where(flip, side - 1 - x, x)
+        y = np.where(flip, side - 1 - y, y)
+        swap = ~ry
+        x, y = np.where(swap, y, x), np.where(swap, x, y)
+        step >>= 1
+    return index
+
+
+def hilbert_order(
+    coords: np.ndarray, groups: Sequence | None = None, bits: int = 16
+) -> np.ndarray:
+    coords = np.asarray(coords, dtype=np.float64)
+    n_cells = coords.shape[0]
+    if groups is None:
+        return np.argsort(hilbert_index_2d(coords, bits), kind="stable")
+
+    codes, _ = pd.factorize(np.asarray(groups), use_na_sentinel=False)
+    if codes.shape[0] != n_cells:
+        raise ValueError("groups must have one entry per cell")
+    keys = np.zeros(n_cells, dtype=np.int64)
+    for code in np.unique(codes):
+        members = codes == code
+        keys[members] = hilbert_index_2d(coords[members], bits)
+    return np.lexsort((keys, codes))
+
+
+def hilbert_rank(
+    coords: np.ndarray, groups: Sequence | None = None, bits: int = 16
+) -> np.ndarray:
+    order = hilbert_order(coords, groups=groups, bits=bits)
+    rank = np.empty_like(order)
+    rank[order] = np.arange(order.shape[0], dtype=order.dtype)
+    return rank
+
+
 class _BaseAdataLoader:
     @staticmethod
     def _read_visium(
@@ -73,6 +136,7 @@ class _BaseAdataLoader:
         embedding = np.load(os.path.join(path, "embeddings.npy"))
         embedding = embedding.reshape(embedding.shape[0], -1)
         embedding = StandardScaler().fit_transform(embedding)
+        n_components = min(n_components, *embedding.shape)
         return PCA(n_components=n_components, random_state=42).fit_transform(embedding)
 
     @staticmethod
@@ -116,7 +180,10 @@ class _BaseAdataLoader:
 
     def _gene_edge_probabilities(self, adj: csr_matrix, feat: np.ndarray) -> csr_matrix:
         embedding = StandardScaler().fit_transform(feat)
-        embedding = PCA(n_components=64, random_state=42).fit_transform(embedding)
+        n_components = min(64, *embedding.shape)
+        embedding = PCA(n_components=n_components, random_state=42).fit_transform(
+            embedding
+        )
         return self._edge_probabilities(adj, embedding, metric="cosine")
 
     def _image_edge_probabilities(
@@ -275,7 +342,13 @@ class BatchAdataLoader(_BaseAdataLoader):
                 "empty intersection. Try a larger n_top_genes."
             )
 
-        merged = concat(self.adata_list, join="outer")
+        merged = concat(
+            self.adata_list,
+            join="outer",
+            label="batch",
+            keys=[str(i) for i in range(len(self.adata_list))],
+            index_unique="-",
+        )
         merged.obsm["feat"] = self._dense(merged[:, merged.var.index.isin(shared_hvg)])
 
         self.merged_adata = merged

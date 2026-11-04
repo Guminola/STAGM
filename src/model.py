@@ -77,7 +77,7 @@ class GPSConv(torch.nn.Module):
             if norm is not None:
                 norm.reset_parameters()
 
-    def _run_mamba(self, node_features: Tensor, batch: Tensor) -> Tensor:
+    def _bidirectional_mamba(self, node_features: Tensor, batch: Tensor) -> Tensor:
         dense, mask = to_dense_batch(node_features, batch)
         forward_out = self.mamba(dense)[mask]
 
@@ -85,6 +85,25 @@ class GPSConv(torch.nn.Module):
         dense_rev, mask_rev = to_dense_batch(node_features[rev_idx], batch[rev_idx])
         backward_out = self.mamba_rev(dense_rev)[mask_rev][rev_idx]
         return self.bidirectional_proj(torch.cat([forward_out, backward_out], dim=-1))
+
+    def _run_mamba(
+        self, node_features: Tensor, batch: Tensor, order: OptTensor = None
+    ) -> Tensor:
+        if order is None:
+            return self._bidirectional_mamba(node_features, batch)
+
+        if order.numel() != node_features.size(0):
+            raise ValueError(
+                f"order has {order.numel()} entries but there are "
+                f"{node_features.size(0)} nodes; it must be a full permutation."
+            )
+        order = order.to(node_features.device)
+        order = order[torch.argsort(batch[order], stable=True)]
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(order.numel(), device=order.device)
+
+        ordered_out = self._bidirectional_mamba(node_features[order], batch[order])
+        return ordered_out[inverse]
 
     def _apply_norm(
         self, norm: nn.Module | None, node_features: Tensor, batch: Tensor
@@ -103,6 +122,7 @@ class GPSConv(torch.nn.Module):
         edge_index: Adj,
         batch: Tensor,
         edge_weight: OptTensor = None,
+        order: OptTensor = None,
         **kwargs,
     ) -> Tensor:
         branch_outputs = []
@@ -119,7 +139,7 @@ class GPSConv(torch.nn.Module):
             branch_outputs.append(local_out)
 
         mamba_input = node_features
-        global_out = self._run_mamba(mamba_input, batch)
+        global_out = self._run_mamba(mamba_input, batch, order=order)
 
         global_out = nn.functional.dropout(
             global_out, p=self.dropout, training=self.training
@@ -189,12 +209,13 @@ class Encoder(torch.nn.Module):
         edge_index: Tensor,
         batch: Tensor,
         edge_weight: OptTensor = None,
+        order: OptTensor = None,
     ) -> Tensor:
         node_emb = self.input_proj(node_features)
 
         for layer in self.gps_layers:
             node_emb = self.activation(
-                layer(node_emb, edge_index, batch, edge_weight=edge_weight)
+                layer(node_emb, edge_index, batch, edge_weight=edge_weight, order=order)
             )
 
         if self._needs_output_proj:
@@ -253,9 +274,10 @@ class MVmodel(_ProjectionMixin):
         edge_index: Tensor,
         batch: Tensor,
         edge_weight: OptTensor = None,
+        order: OptTensor = None,
     ) -> Tensor:
         gnn_embedding = self.encoder(
-            node_features, edge_index, batch, edge_weight=edge_weight
+            node_features, edge_index, batch, edge_weight=edge_weight, order=order
         )
         return self.projection(gnn_embedding)
 
@@ -323,9 +345,10 @@ class SVmodel(_ProjectionMixin):
         edge_index: Tensor,
         batch: Tensor,
         edge_weight: OptTensor = None,
+        order: OptTensor = None,
     ) -> Tensor:
         gnn_embedding = self.encoder(
-            node_features, edge_index, batch, edge_weight=edge_weight
+            node_features, edge_index, batch, edge_weight=edge_weight, order=order
         )
         return self.projection(gnn_embedding)
 

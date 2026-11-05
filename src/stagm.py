@@ -97,12 +97,12 @@ class STAGM:
         self.num_hidden: int = getattr(config, "num_hidden", 128)
         self.num_proj_hidden: int = getattr(config, "num_proj_hidden", 128)
         self.num_layers: int = getattr(config, "num_layers", 1)
-        self.num_clusters: int = getattr(config, "num_clusters", 7)
+        self.num_clusters: int | None = getattr(config, "num_clusters", None)
         self.k: int | None = getattr(config, "k", None)
         self.activation = _ACTIVATIONS[getattr(config, "activation", "relu")]
 
         # Encoder options
-        self.dropout: float = getattr(config, "dropout", 0.2)
+        self.dropout: float = getattr(config, "dropout", 0.5)
         self.d_state: int = getattr(config, "d_state", 16)
         self.d_conv: int = getattr(config, "d_conv", 4)
 
@@ -545,9 +545,19 @@ class STAGM:
                 f"Choose one of {_SUPPORTED_CLUSTER_TOOLS}."
             )
 
+        num_clusters = self.num_clusters
+        if num_clusters is None:
+            if "ground_truth" not in self.adata.obs:
+                raise ValueError(
+                    "num_clusters was not set in the config and adata.obs has no "
+                    "'ground_truth' column to infer it from."
+                )
+            num_clusters = int(self.adata.obs["ground_truth"].dropna().nunique())
+            print(f"num_clusters inferred from ground_truth: {num_clusters}")
+
         clustering(
             self.adata,
-            self.num_clusters,
+            num_clusters,
             radius=self.radius,
             key=self.cluster_rep,
             method=self.tool,

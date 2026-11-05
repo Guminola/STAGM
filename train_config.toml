@@ -1,0 +1,19 @@
+# Model configurations per slice.
+# Each table is keyed by the slide ID and is loaded as the model `config`.
+
+[151673]
+seed = 39788
+learning_rate = 1e-4
+activation = "relu"
+dropout = 0.5
+drop_feature_rate_1 = 0.3
+drop_feature_rate_2 = 0.4
+tau = 40
+num_epochs = 400
+num_layers = 1
+num_hidden = 128
+num_proj_hidden = 128
+
+num_neigh = 8
+num_clusters = 7
+num_gene = 3000

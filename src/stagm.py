@@ -11,7 +11,6 @@ from sklearn import metrics
 from sklearn.cluster import KMeans
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from torch import nn
-from torch.nn.modules.batchnorm import _BatchNorm
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from tqdm import tqdm
@@ -24,7 +23,6 @@ from .model import (
     drop_feature,
     edge_weight_from_probabilities,
     multiple_dropout_average,
-    sampled_edge_weight,
     symmetrize_edge_attr,
 )
 
@@ -34,8 +32,6 @@ _SUPPORTED_CLUSTER_TOOLS = ("leiden", "louvain")
 
 _OPTIMIZERS = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW}
 
-_CLUSTER_REPS = ("emb", "norm_emb")
-
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -43,11 +39,6 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def l2_normalize(embedding: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(embedding, axis=1, keepdims=True)
-    return embedding / np.maximum(norms, 1e-12)
 
 
 def generate_pseudo_labels(img_emb: np.ndarray, n_clusters: int = 300) -> torch.Tensor:
@@ -83,6 +74,13 @@ def edge_attr_for_index(matrix, edge_index: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(values, dtype=torch.float32)
 
 
+def convert_edge_probabilities(
+    adj_matrix: torch.Tensor, edge_prob_matrix: torch.Tensor
+) -> torch.Tensor:
+    row, col = torch.where(adj_matrix != 0)
+    return edge_prob_matrix[row, col]
+
+
 class STAGM:
     def __init__(
         self,
@@ -107,7 +105,7 @@ class STAGM:
         self.d_conv: int = getattr(config, "d_conv", 4)
 
         # Training hyperparameters
-        self.optimizer_name: str = getattr(config, "optimizer", "adamw")
+        self.optimizer_name: str = getattr(config, "optimizer", "adam")
         self.learning_rate: float = getattr(config, "learning_rate", 1e-4)
         self.weight_decay: float = getattr(config, "weight_decay", 1e-04)
         self.num_epochs: int = getattr(config, "num_epochs", 200)
@@ -116,11 +114,10 @@ class STAGM:
         self.drop_feature_rate_2: float = getattr(config, "drop_feature_rate_2", 0.4)
 
         # Experiment / runtime options
+        self.seed: int | None = getattr(config, "seed", 0)
         self.single: bool = getattr(config, "single", False)
         self.refine: bool = getattr(config, "refine", True)
         self.checkpoint_path: str = getattr(config, "checkpoint_path", "model.pt")
-        self.seed: int | None = getattr(config, "seed", 0)
-        self.recalibrate_norm: bool = getattr(config, "recalibrate_norm", True)
 
         # Mini-batch options
         self.use_minibatch: bool | None = getattr(config, "use_minibatch", None)
@@ -136,20 +133,11 @@ class STAGM:
         self.radius: int = getattr(config, "radius", 15)
         self.tool: str = getattr(config, "tool", "leiden")
         self.mask_slices: bool = getattr(config, "mask_slices", True)
-        self.cluster_rep: str = getattr(config, "cluster_rep", "norm_emb")
-        self.cluster_start: float = getattr(config, "cluster_start", 0.01)
-        self.cluster_end: float = getattr(config, "cluster_end", 1.0)
-        self.cluster_increment: float = getattr(config, "cluster_increment", 0.005)
 
         if self.optimizer_name not in _OPTIMIZERS:
             raise ValueError(
                 f"Unsupported optimizer '{self.optimizer_name}'. "
                 f"Choose one of {tuple(_OPTIMIZERS)}."
-            )
-        if self.cluster_rep not in _CLUSTER_REPS:
-            raise ValueError(
-                f"Unsupported cluster_rep '{self.cluster_rep}'. "
-                f"Choose one of {_CLUSTER_REPS}."
             )
 
         # Progress-bar style
@@ -239,9 +227,10 @@ class STAGM:
     def _train_full_batch(self) -> None:
         features_matrix, graph_neigh, edge_index, batch = self._prepare_graph_tensors()
 
-        edge_probs = edge_attr_for_index(
-            self.adata.obsm["edge_probabilities"], edge_index
+        edge_probabilities = torch.FloatTensor(
+            _to_dense_array(self.adata.obsm["edge_probabilities"])
         ).to(self.device)
+        edge_probs = convert_edge_probabilities(graph_neigh, edge_probabilities)
 
         mask_neigh = None
         pseudo_labels = None
@@ -275,13 +264,13 @@ class STAGM:
                 x_1,
                 edge_index_1,
                 batch,
-                edge_weight=sampled_edge_weight(edge_attr_1),
+                edge_weight=edge_weight_from_probabilities(edge_attr_1),
             )
             z2 = self.model(
                 x_2,
                 edge_index_2,
                 batch,
-                edge_weight=sampled_edge_weight(edge_attr_2),
+                edge_weight=edge_weight_from_probabilities(edge_attr_2),
             )
 
             if self.single:
@@ -388,13 +377,13 @@ class STAGM:
                     x_1,
                     edge_index_1,
                     sub_batch,
-                    edge_weight=sampled_edge_weight(edge_attr_1),
+                    edge_weight=edge_weight_from_probabilities(edge_attr_1),
                 )
                 z2_full = self.model(
                     x_2,
                     edge_index_2,
                     sub_batch,
-                    edge_weight=sampled_edge_weight(edge_attr_2),
+                    edge_weight=edge_weight_from_probabilities(edge_attr_2),
                 )
                 z1 = z1_full[:num_seed]
                 z2 = z2_full[:num_seed]
@@ -419,9 +408,7 @@ class STAGM:
 
     def eva(self) -> None:
         print("=== load ===")
-        self.model.load_state_dict(
-            torch.load(self.checkpoint_path, map_location=self.device)
-        )
+        self.model.load_state_dict(torch.load(self.checkpoint_path))
         self.model.eval()
 
         features_matrix = torch.FloatTensor(self.adata.obsm["feat"].copy()).to(
@@ -436,50 +423,21 @@ class STAGM:
             features_matrix.size(0), dtype=torch.long, device=self.device
         )
 
-        edge_weight = edge_weight_from_probabilities(edge_probs)
-
-        if self.recalibrate_norm:
-            self._recalibrate_norm_stats(
-                features_matrix, edge_index, batch, edge_weight
-            )
-
         with torch.no_grad():
-            emb = (
-                self.model(features_matrix, edge_index, batch, edge_weight=edge_weight)
+            self.adata.obsm["emb"] = (
+                self.model(
+                    features_matrix,
+                    edge_index,
+                    batch,
+                    edge_weight=edge_weight_from_probabilities(edge_probs),
+                )
                 .detach()
                 .cpu()
                 .numpy()
             )
-        self.adata.obsm["emb"] = emb
-        self.adata.obsm["norm_emb"] = l2_normalize(emb)
 
         self._print_diagnostics()
         print("embedding generated, go clustering")
-
-    def _recalibrate_norm_stats(
-        self,
-        features_matrix: torch.Tensor,
-        edge_index: torch.Tensor,
-        batch: torch.Tensor,
-        edge_weight: torch.Tensor,
-    ) -> None:
-        norms = [m for m in self.model.modules() if isinstance(m, _BatchNorm)]
-        if not norms:
-            return
-
-        momenta = [m.momentum for m in norms]
-        for norm in norms:
-            norm.reset_running_stats()
-            norm.momentum = None
-            norm.train()
-
-        with torch.no_grad():
-            self.model(features_matrix, edge_index, batch, edge_weight=edge_weight)
-
-        for norm, momentum in zip(norms, momenta):
-            norm.momentum = momentum
-            norm.eval()
-        print(f"recalibrated {len(norms)} BatchNorm layers on clean inputs")
 
     def _print_diagnostics(self) -> None:
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -559,11 +517,11 @@ class STAGM:
             self.adata,
             num_clusters,
             radius=self.radius,
-            key=self.cluster_rep,
+            key="emb",
             method=self.tool,
-            start=self.cluster_start,
-            end=self.cluster_end,
-            increment=self.cluster_increment,
+            start=0.01,
+            end=0.27,
+            increment=0.005,
             refinement=self.refine,
         )
 
@@ -582,10 +540,10 @@ class STAGM:
         else:
             print("calculate SC and DB")
             sc_score = silhouette_score(
-                self.adata.obsm[self.cluster_rep], self.adata.obs["domain"]
+                self.adata.obsm["emb"], self.adata.obs["domain"]
             )
             db_score = davies_bouldin_score(
-                self.adata.obsm[self.cluster_rep], self.adata.obs["domain"]
+                self.adata.obsm["emb"], self.adata.obs["domain"]
             )
             self.adata.uns["sc"] = sc_score
             self.adata.uns["db"] = db_score
@@ -638,7 +596,7 @@ class STAGM:
 
     def draw_umap(self) -> None:
         print("start umap")
-        sc.pp.neighbors(self.adata, use_rep=self.cluster_rep)
+        sc.pp.neighbors(self.adata, use_rep="emb")
         sc.tl.umap(self.adata)
         sc.pl.umap(
             self.adata,

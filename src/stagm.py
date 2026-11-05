@@ -97,7 +97,7 @@ class STAGM:
         self.num_layers: int = getattr(config, "num_layers", 1)
         self.num_clusters: int | None = getattr(config, "num_clusters", None)
         self.k: int | None = getattr(config, "k", None)
-        self.activation = _ACTIVATIONS[getattr(config, "activation", "relu")]
+        self.activation = _ACTIVATIONS[getattr(config, "activation", "prelu")]
 
         # Encoder options
         self.dropout: float = getattr(config, "dropout", 0.5)

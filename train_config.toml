@@ -1,19 +1,85 @@
 # Model configurations per slice.
-# Each table is keyed by the slide ID and is loaded as the model `config`.
+
+[default]
+seed = 39788
+num_epochs = 400
+num_neigh = 8
+num_gene = 3000
+
+[151507]
+seed = 39788
+num_epochs = 400
+num_gene = 3000
+num_neigh = 8
+num_clusters = 7
+activation = "prelu"
+tau = 40
+
+[151508]
+seed = 39788
+num_epochs = 400
+num_gene = 3000
+num_neigh = 8
+num_clusters = 7
+activation = "prelu"
+tau = 40
+
+[151509]
+seed = 39788
+num_epochs = 400
+num_gene = 3000
+num_neigh = 8
+num_clusters = 7
+activation = "prelu"
+tau = 40
+
+[151669]
+seed = 39788
+num_epochs = 400
+num_gene = 3000
+num_neigh = 8
+num_clusters = 5
+activation = "relu"
+learning_rate = 1e-5
+tau = 0.2
+
+[151670]
+seed = 39788
+num_epochs = 400
+num_gene = 3000
+num_neigh = 8
+num_clusters = 5
+activation = "relu"
+learning_rate = 1e-5
+dropout = 0.2
+tau = 0.2
+
+[151671]
+seed = 39788
+num_epochs = 400
+num_gene = 3000
+num_neigh = 8
+num_clusters = 5
+activation = "relu"
+learning_rate = 1e-5
+dropout = 0.2
+tau = 0.2
+
+[151672]
+seed = 39788
+num_epochs = 400
+num_gene = 3000
+num_neigh = 8
+num_clusters = 5
+activation = "prelu"
+learning_rate = 1e-5
+tau = 0.2
 
 [151673]
 seed = 39788
-learning_rate = 1e-4
-activation = "relu"
-dropout = 0.5
-drop_feature_rate_1 = 0.3
-drop_feature_rate_2 = 0.4
-tau = 40
 num_epochs = 400
-num_layers = 1
-num_hidden = 128
-num_proj_hidden = 128
-
+num_gene = 3000
 num_neigh = 8
 num_clusters = 7
-num_gene = 3000
+activation = "relu"
+tau = 40
